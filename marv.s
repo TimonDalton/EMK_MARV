@@ -102,6 +102,8 @@ current_sensor_cal_blue_on_blue_var     EQU 0x39
 current_sensor_cal_blue_on_white_var    EQU 0x3A
 current_sensor_cal_blue_on_black_var    EQU 0x3B
 
+has_read_all_black_on_sensor_array_var	EQU 0x3E  
+    
 RACE_COL_var                            EQU 0x2B
 PERCEIVED_COLOUR_AT_SENSOR_BITS_var	EQU 0x3C
 DRIVING_STATE_var                       EQU 0x2C
@@ -1005,23 +1007,32 @@ GOTO    LLI_STATE
     return
     
     set_driving_state_from_saved_sensor_colour_perception_array:
-;LEFT_DRIVING_STATE_val    equ 0x0
-;CENTRE_DRIVING_STATE_val   equ 0x1
-;RIGHT_DRIVING_STATE_val    equ 0x2
-;STOP_DRIVING_STATE_val        equ 0x3
-;LOST_DRIVING_STATE_val        equ 0x4
+    
+    ;Test for stop
+	BTFSC   has_read_all_black_on_sensor_array_var,0,a
+	BRA	set_driving_state_stop
+    
+    ;Go Right Tests
 	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
 	XORLW	0b00000001
 	BZ	set_driving_state_right
 	
 	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
+	XORLW	0b00000011
+	BZ	set_driving_state_right
+    ;Go Straight Tests
+	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
 	XORLW	0b00000010
 	BZ	set_driving_state_centre
 	
+    ;Go Left Tests
 	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
 	XORLW	0b00000100
 	BZ	set_driving_state_left
-	
+	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
+	XORLW	0b00000110
+	BZ	set_driving_state_left
+    ;Fall through lost state
 	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
 	XORLW	0b00000001
 	BZ	set_driving_state_right
@@ -1033,16 +1044,29 @@ GOTO    LLI_STATE
 	
 	set_driving_state_right:
 	    MOVLW   RIGHT_DRIVING_STATE_val
-;	    MOVWF   
+	    MOVWF   DRIVING_STATE_var,a
 	    return
 	set_driving_state_centre:
+	    MOVLW   CENTRE_DRIVING_STATE_val
+	    MOVWF   DRIVING_STATE_var,a
 	    return
 	set_driving_state_left:
+	    MOVLW   LEFT_DRIVING_STATE_val
+	    MOVWF   DRIVING_STATE_var,a
+	    return
+	set_driving_state_lost:
+	    MOVLW   LOST_DRIVING_STATE_val
+	    MOVWF   DRIVING_STATE_var,a
+	    return
+	set_driving_state_stop:
+	    MOVLW   STOP_DRIVING_STATE_val
+	    MOVWF   DRIVING_STATE_var,a
 	    return
     
     set_bits_on_colour_perception_array:
                        
     CLRF    PERCEIVED_COLOUR_AT_SENSOR_BITS_var,a
+    CLRF    has_read_all_black_on_sensor_array_var,a
 		       
     ;Check if L = selected colour
     MOVF    RACE_COL_var,W,a
@@ -1058,6 +1082,22 @@ GOTO    LLI_STATE
     MOVF    RACE_COL_var,W,a
     XORWF   sensor_R_read_colour_enum_var,a
     BZ      set_R_on_line_bit
+    
+    ;CHECK FOR ALL BLACK    
+    MOVF    sensor_L_read_colour_enum_var,W,a
+    XORLW   BLACK_COLOUR_STATE_val
+    BNZ     not_all_black_on_line_bits
+    
+    MOVF    sensor_C_read_colour_enum_var,W,a
+    XORLW   BLACK_COLOUR_STATE_val
+    BNZ     not_all_black_on_line_bits
+    
+    MOVF    sensor_R_read_colour_enum_var,W,a
+    XORLW   BLACK_COLOUR_STATE_val
+    BNZ     not_all_black_on_line_bits
+    
+    ;ALL BLACK CONFIRMED
+    BSF	    has_read_all_black_on_sensor_array_var,0,a
     return
 	set_L_on_line_bit:
 	    BSF PERCEIVED_COLOUR_AT_SENSOR_BITS_var,2
@@ -1068,6 +1108,8 @@ GOTO    LLI_STATE
 	set_R_on_line_bit:
 	    BSF PERCEIVED_COLOUR_AT_SENSOR_BITS_var,0
 	return
+	not_all_black_on_line_bits:
+	    return
     
 
 ;</editor-fold>
