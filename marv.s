@@ -291,8 +291,9 @@ RIGHT_DRIVING_STATE_val    equ 0x2
 STOP_DRIVING_STATE_val        equ 0x3
 LOST_DRIVING_STATE_val        equ 0x4
 
-PWM_SPEED_FULL  equ 15      ; 75% duty cycle ? cruise/turn outer wheel
-PWM_SPEED_STOP  equ 0       ; 0% ? motor off
+PWM_SPEED_FULL_LEFT_val  equ 16      ; > 75% duty cycle
+PWM_SPEED_FULL_RIGHT_val  equ 15      ; 75% duty cycle 
+PWM_SPEED_STOP_val  equ 0       ; 0% ? motor off
 
 ; WAIT_FOR_TOUCH tuning constants
 WFT_THRESH      equ 0x03    ; min delta (baseline-reading) to count as touch
@@ -312,7 +313,7 @@ ORG 0x8
 GOTO ISR
 ISR:
 ;<editor-fold defaultstate="collapsed" desc="ISR">
-    
+
     ; Was this a PORTC IOC interrupt?
 ;
         ; INT0 (RB0)?
@@ -612,7 +613,7 @@ Init:
     clrf    motor_power_right_var, a
     clrf    motor_dir_left_var, a
     clrf    motor_dir_right_var, a
-    movlw   PWM_SPEED_STOP
+    movlw   PWM_SPEED_STOP_val
     movwf   CCPR1L, a           ; Right motor stopped
     movwf   CCPR2L, a           ; Left motor stopped
 
@@ -1118,10 +1119,10 @@ LLI_STATE:
     MOVLW    L_SSD
     MOVWF    SSD_OUT_var,a
     call    SET_SSD
-    MOVLW   PWM_SPEED_STOP
+    MOVLW   PWM_SPEED_STOP_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
-    MOVLW   PWM_SPEED_FULL
+    MOVLW   PWM_SPEED_FULL_LEFT_val
     MOVWF   motor_power_right_var, a
     call    set_motor_right
     GOTO    LLI_NAV_LOOP        ; reached via BZ branch ? must loop, not return
@@ -1132,10 +1133,10 @@ LLI_STATE:
     MOVLW    C_SSD
     MOVWF    SSD_OUT_var,a
     call    SET_SSD
-    MOVLW   PWM_SPEED_FULL
+    MOVLW   PWM_SPEED_FULL_LEFT_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
-    MOVLW   PWM_SPEED_FULL
+    MOVLW   PWM_SPEED_FULL_RIGHT_val
     MOVWF   motor_power_right_var, a
     call    set_motor_right
     GOTO    LLI_NAV_LOOP        ; reached via BZ branch ? must loop, not return
@@ -1146,10 +1147,10 @@ LLI_STATE:
     MOVLW    r_SSD
     MOVWF    SSD_OUT_var,a
     call    SET_SSD
-    MOVLW   PWM_SPEED_FULL
+    MOVLW   PWM_SPEED_FULL_RIGHT_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
-    MOVLW   PWM_SPEED_STOP
+    MOVLW   PWM_SPEED_STOP_val
     MOVWF   motor_power_right_var, a
     call    set_motor_right
     GOTO    LLI_NAV_LOOP        ; reached via BZ branch ? must loop, not return
@@ -1160,10 +1161,10 @@ LLI_STATE:
     MOVLW    U_SSD
     MOVWF    SSD_OUT_var,a
     call    SET_SSD
-    MOVLW   PWM_SPEED_STOP
+    MOVLW   PWM_SPEED_STOP_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
-    MOVLW   PWM_SPEED_FULL
+    MOVLW   PWM_SPEED_FULL_RIGHT_val
     MOVWF   motor_power_right_var, a
     call    set_motor_right
     GOTO    LLI_NAV_LOOP        ; reached via BZ branch ? must loop, not return
@@ -1174,7 +1175,7 @@ LLI_STATE:
     MOVLW    U_SSD
     MOVWF    SSD_OUT_var,a
     call     SET_SSD
-    MOVLW   PWM_SPEED_STOP
+    MOVLW   PWM_SPEED_STOP_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
     MOVWF   motor_power_right_var, a
@@ -1192,7 +1193,7 @@ LLI_STATE:
     MOVWF   CCPR2L, a                   ; IN1 PWM
     RETURN
     set_motor_left_rev:
-    MOVLW   PWM_SPEED_STOP
+    MOVLW   PWM_SPEED_STOP_val
     MOVWF   CCPR2L, a                   ; IN1 off
     BSF     LATC, 0, a                  ; IN2 high ? full reverse
     RETURN
@@ -1207,7 +1208,7 @@ LLI_STATE:
     MOVWF   CCPR1L, a                   ; IN3 PWM
     RETURN
     set_motor_right_rev:
-    MOVLW   PWM_SPEED_STOP
+    MOVLW   PWM_SPEED_STOP_val
     MOVWF   CCPR1L, a                   ; IN3 off
     BSF     LATC, 3, a                  ; IN4 high ? full reverse
     RETURN
@@ -2342,7 +2343,7 @@ _LCD_SEND_NIBBLE:
     BCF     LATB, 3, a
     BTFSC   lcd_temp_var, 3, a
     BSF     LATB, 3, a
-    ; Strobe E (RD4) high then low ? min 450 ns, 2 NOPs = 2 µs at 4 MHz
+    ; Strobe E (RD4) high then low ? min 450 ns, 2 NOPs = 2 ï¿½s at 4 MHz
     BSF     LATD, 4, a
     NOP
     NOP
@@ -2350,9 +2351,9 @@ _LCD_SEND_NIBBLE:
     RETURN
 
 ; --- _LCD_DELAY_50US ---
-; ~50 µs busy-wait (covers 37 µs HD44780 command execution time).
+; ~50 ï¿½s busy-wait (covers 37 ï¿½s HD44780 command execution time).
 _LCD_DELAY_50US:
-    MOVLW   0x0D                    ; 13 x 4 cycles = 52 µs
+    MOVLW   0x0D                    ; 13 x 4 cycles = 52 ï¿½s
     MOVWF   lcd_temp_var, a
 _LCD_D50_L:
     DECFSZ  lcd_temp_var, f, a
