@@ -128,14 +128,16 @@ touch_sample1_var                       EQU 0x4D    ; 16-sample accumulator high
 touch_sample2_var                       EQU 0x4E    ; 16-sample accumulator low / result
 touch_sample3_var                       EQU 0x4F    ; sample loop counter / delta temp
 
-lcd_temp_var                            EQU 0x50    ; LCD nibble scratch (_LCD_SEND_NIBBLE)
-lcd_temp2_var                           EQU 0x51    ; LCD byte scratch (LCD_CMD / LCD_CHAR)
-lcd_temp3_var                           EQU 0x52    ; LCD_PRINT_HEX byte save
+lcd_temp_var                            EQU 0x50    ; LCD nibble scratch (_PRAC_3_SEND_NIBBLE)
+lcd_temp2_var                           EQU 0x51    ; LCD byte scratch (PRAC_3_CMD / PRAC_3_CHAR)
+lcd_temp3_var                           EQU 0x52    ; PRAC_3_PRINT_HEX byte save
 
 RACE_COL_var                            EQU 0x2B
 PERCEIVED_COLOUR_AT_SENSOR_BITS_var	EQU 0x3C
 DRIVING_STATE_var                       EQU 0x2C
 DRIVING_STATE_SSD_DISPLAY_var		EQU 0x3D
+		
+black_confirm_count_var			EQU 0x3F
 
 ;</editor-fold>
 
@@ -238,12 +240,12 @@ osc_delay_state_val equ 0x5
 ;Calibration/Colour Detect/LLI Constants
 calibration_constants:
     ;used as indexes for colour enum
-RED_COLOUR_STATE_val equ    0x0
-GREEN_COLOUR_STATE_val equ  0x1
-BLUE_COLOUR_STATE_val equ   0x2
-BLACK_COLOUR_STATE_val equ  0x3
-WHITE_COLOUR_STATE_val equ 0x4
-UNKNOWN_COLOUR_val equ 0x5
+RED_COLOUR_STATE_val equ    0x1
+GREEN_COLOUR_STATE_val equ  0x2
+BLUE_COLOUR_STATE_val equ   0x3
+BLACK_COLOUR_STATE_val equ  0x4
+WHITE_COLOUR_STATE_val equ 0x5
+UNKNOWN_COLOUR_val equ 0x6
  
 ;Sensor Constants
 matching_floor_to_strobe_colour_reading_diff_multiplier_val equ    0x3
@@ -625,7 +627,7 @@ Init:
     MOVLW   LOST_DRIVING_STATE_val
     MOVWF   DRIVING_STATE_var, a
 
-    CALL    LCD_INIT
+    CALL    PRAC_3_INIT
 
 ;</editor-fold>
 
@@ -973,9 +975,6 @@ FEEDBACK_COLOUR_STATE:
 GOTO    FEEDBACK_COLOUR_STATE
     
     
-;</editor-fold>
-   
- 
     disp_centre_sensor_stored_colour:
     call    clear_disp_SSD_dot
     MOVF    sensor_C_read_colour_enum_var,W,a
@@ -1016,6 +1015,7 @@ GOTO    FEEDBACK_COLOUR_STATE
 	call    set_disp_rgb_black
 	call    set_disp_SSD_dot
 	return
+	
 ;</editor-fold>
 
     ; Sets the RGB display LED to match RACE_COL_var (used in LLI_STATE before touch start)
@@ -1054,6 +1054,9 @@ GOTO    FEEDBACK_COLOUR_STATE
     RETURN
     
     
+
+;</editor-fold>
+    
 LLI_STATE:
 ;<editor-fold defaultstate="collapsed" desc="LLI SECTION">
     MOVLW   L_SSD
@@ -1071,27 +1074,29 @@ LLI_STATE:
     call    POLL_SENSORS_FOR_NEWEST_DRIVING_STATE_AND_UPDATE_STATE
     
     MOVF    DRIVING_STATE_var,W,a
-    XORLW    LEFT_DRIVING_STATE_val
-    BZ    set_LLI_left
+    XORLW   LEFT_DRIVING_STATE_val
+    BZ	    set_LLI_left
     
     MOVF    DRIVING_STATE_var,W,a
     XORLW    CENTRE_DRIVING_STATE_val
-    BZ    set_LLI_centre
+    BZ	    set_LLI_centre
     
     MOVF    DRIVING_STATE_var,W,a
-    XORLW    RIGHT_DRIVING_STATE_val
-    BZ    set_LLI_right
+    XORLW   RIGHT_DRIVING_STATE_val
+    BZ	    set_LLI_right
     
     MOVF    DRIVING_STATE_var,W,a
-    XORLW    LOST_DRIVING_STATE_val
-    BZ    set_LLI_lost
+    XORLW   LOST_DRIVING_STATE_val
+    BZ	    set_LLI_lost
     
     MOVF    DRIVING_STATE_var,W,a
-    XORLW    STOP_DRIVING_STATE_val
-    BZ    LLI_NAV_STOP
+    XORLW   STOP_DRIVING_STATE_val
+    BZ	    has_read_all_black;;Needs a configurable amount of repeats to activate
     
     call    NAV_STATE_IF_REQUIRED
-
+    
+    CLRF    black_confirm_count_var, a
+    
     GOTO    LLI_NAV_LOOP
     
     LLI_NAV_STOP:
@@ -1108,16 +1113,11 @@ LLI_STATE:
     call    NAV_STATE_IF_REQUIRED
     GOTO    LLI_STOP_WAIT
     
-; LEFT_DRIVING_STATE_val    equ 0x0
-; CENTRE_DRIVING_STATE_val    equ 0x1
-; RIGHT_DRIVING_STATE_val    equ 0x2
-; STOP_DRIVING_STATE_val    equ 0x3
-; LOST_DRIVING_STATE_val    equ 0x4
     set_LLI_left:
-    MOVLW    LEFT_DRIVING_STATE_val
-    MOVWF    DRIVING_STATE_var,a
-    MOVLW    L_SSD
-    MOVWF    SSD_OUT_var,a
+    MOVLW   LEFT_DRIVING_STATE_val
+    MOVWF   DRIVING_STATE_var,a
+    MOVLW   L_SSD
+    MOVWF   SSD_OUT_var,a
     call    SET_SSD
     MOVLW   PWM_SPEED_STOP_val
     MOVWF   motor_power_left_var, a
@@ -1168,6 +1168,14 @@ LLI_STATE:
     MOVWF   motor_power_right_var, a
     call    set_motor_right
     GOTO    LLI_NAV_LOOP        ; reached via BZ branch ? must loop, not return
+    
+    has_read_all_black:
+    INCF    black_confirm_count_var, F, a
+    MOVLW   0x20;Need 16 Consequtive black reads
+    CPFSLT  black_confirm_count_var
+    BRA	    set_LLI_stop
+    GOTO    LLI_NAV_LOOP
+    
     set_LLI_stop:
     MOVLW    STOP_DRIVING_STATE_val
     MOVWF    DRIVING_STATE_var,a
@@ -1484,15 +1492,12 @@ _TOUCH_1S_L1:
 	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
 	XORLW	0b00000110
 	BZ	set_driving_state_left
-    ;Fall through lost state
+    ;All three sensors on line — treat as centre
 	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
-	XORLW	0b00000001
-	BZ	set_driving_state_right
-	
-	MOVF	PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
-	XORLW	0b00000001
-	BZ	set_driving_state_right
-	return
+	XORLW	0b00000111
+	BZ	set_driving_state_centre
+    ;No pattern matched — truly lost
+	BRA	set_driving_state_lost
 	
 	set_driving_state_right:
 	    MOVLW   RIGHT_DRIVING_STATE_val
@@ -1522,24 +1527,21 @@ _TOUCH_1S_L1:
 
     ;Check if L = selected colour ? fall through to check C regardless
     MOVF    RACE_COL_var,W,a
-    XORWF   sensor_L_read_colour_enum_var,a
-    BNZ     skip_L_on_line_bit
+    XORWF   sensor_L_read_colour_enum_var,W,a
+    BNZ     $+4
     BSF     PERCEIVED_COLOUR_AT_SENSOR_BITS_var,2
-    skip_L_on_line_bit:
 
     ;Check if C = selected colour ? fall through to check R regardless
     MOVF    RACE_COL_var,W,a
-    XORWF   sensor_C_read_colour_enum_var,a
-    BNZ     skip_C_on_line_bit
+    XORWF   sensor_C_read_colour_enum_var,W,a
+    BNZ     $+4
     BSF     PERCEIVED_COLOUR_AT_SENSOR_BITS_var,1
-    skip_C_on_line_bit:
 
     ;Check if R = selected colour ? fall through to all-black check regardless
     MOVF    RACE_COL_var,W,a
-    XORWF   sensor_R_read_colour_enum_var,a
-    BNZ     skip_R_on_line_bit
+    XORWF   sensor_R_read_colour_enum_var,W,a
+    BNZ     $+4
     BSF     PERCEIVED_COLOUR_AT_SENSOR_BITS_var,0
-    skip_R_on_line_bit:
 
     ;If any race colour bit was set, skip all-black check
     MOVF    PERCEIVED_COLOUR_AT_SENSOR_BITS_var,W,a
@@ -2009,6 +2011,10 @@ read_and_save_sensor_array_perception:
     NOP
     NOP
     NOP
+    NOP
+    NOP
+    NOP
+    NOP
 
     BSF     ADCON0, 1, a
     wait_adc:
@@ -2201,10 +2207,10 @@ display_error:
 ; Pins: RS=RD3  E=RD4  D4=RD5  D5=RD6  D6=RD7  D7=RB3
 ; ============================================================
 
-; --- LCD_INIT ---
+; --- PRAC_3_INIT ---
 ; Power-on initialisation. Call once during startup.
 ; Leaves display on, cursor off, 2-line 5x8, cursor auto-increment.
-LCD_INIT:
+PRAC_3_INIT:
     BCF     LATD, 3, a              ; RS = 0
     BCF     LATD, 4, a              ; E  = 0
     BCF     LATB, 3, a              ; D7 = 0
@@ -2214,121 +2220,121 @@ LCD_INIT:
 
     ; Three 0x03 nibbles ? hardware reset sequence
     MOVLW   0x03
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
+    CALL    _PRAC_3_SEND_NIBBLE
+    CALL    _PRAC_3_DELAY_5MS
     MOVLW   0x03
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
+    CALL    _PRAC_3_SEND_NIBBLE
+    CALL    _PRAC_3_DELAY_5MS
     MOVLW   0x03
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
+    CALL    _PRAC_3_SEND_NIBBLE
+    CALL    _PRAC_3_DELAY_5MS
 
     ; Switch to 4-bit interface
     MOVLW   0x02
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
+    CALL    _PRAC_3_SEND_NIBBLE
+    CALL    _PRAC_3_DELAY_5MS
 
     ; Function set: 4-bit bus, 2-line, 5x8 font
     MOVLW   0x28
-    CALL    LCD_CMD
+    CALL    PRAC_3_CMD
     ; Display on, cursor off, blink off
     MOVLW   0x0C
-    CALL    LCD_CMD
+    CALL    PRAC_3_CMD
     ; Entry mode: cursor moves right, no display shift
     MOVLW   0x06
-    CALL    LCD_CMD
+    CALL    PRAC_3_CMD
     ; Clear display (needs 2 ms)
-    CALL    LCD_CLEAR
+    CALL    PRAC_3_CLEAR
     RETURN
 
-; --- LCD_CMD ---
+; --- PRAC_3_CMD ---
 ; Send byte in W as command (RS=0, two nibbles high-then-low).
-LCD_CMD:
+PRAC_3_CMD:
     MOVWF   lcd_temp2_var, a        ; save command byte
     BCF     LATD, 3, a              ; RS = 0
     SWAPF   lcd_temp2_var, W, a
     ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE        ; send high nibble
-    CALL    _LCD_DELAY_50US
+    CALL    _PRAC_3_SEND_NIBBLE        ; send high nibble
+    CALL    _PRAC_3_DELAY_50US
     MOVF    lcd_temp2_var, W, a
     ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE        ; send low nibble
-    CALL    _LCD_DELAY_50US
+    CALL    _PRAC_3_SEND_NIBBLE        ; send low nibble
+    CALL    _PRAC_3_DELAY_50US
     RETURN
 
-; --- LCD_CHAR ---
+; --- PRAC_3_CHAR ---
 ; Send byte in W as character data (RS=1).
-LCD_CHAR:
+PRAC_3_CHAR:
     MOVWF   lcd_temp2_var, a
     BSF     LATD, 3, a              ; RS = 1
     SWAPF   lcd_temp2_var, W, a
     ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE        ; send high nibble
-    CALL    _LCD_DELAY_50US
+    CALL    _PRAC_3_SEND_NIBBLE        ; send high nibble
+    CALL    _PRAC_3_DELAY_50US
     MOVF    lcd_temp2_var, W, a
     ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE        ; send low nibble
-    CALL    _LCD_DELAY_50US
+    CALL    _PRAC_3_SEND_NIBBLE        ; send low nibble
+    CALL    _PRAC_3_DELAY_50US
     BCF     LATD, 3, a              ; RS = 0
     RETURN
 
-; --- LCD_CLEAR ---
+; --- PRAC_3_CLEAR ---
 ; Clear display and home cursor (2 ms execution time on HD44780).
-LCD_CLEAR:
+PRAC_3_CLEAR:
     MOVLW   0x01
-    CALL    LCD_CMD
-    CALL    _LCD_DELAY_2MS
+    CALL    PRAC_3_CMD
+    CALL    _PRAC_3_DELAY_2MS
     RETURN
 
-; --- LCD_LINE1 ---
+; --- PRAC_3_LINE1 ---
 ; Set cursor to column 0 of line 1.
-LCD_LINE1:
+PRAC_3_LINE1:
     MOVLW   0x80
-    CALL    LCD_CMD
+    CALL    PRAC_3_CMD
     RETURN
 
-; --- LCD_LINE2 ---
+; --- PRAC_3_LINE2 ---
 ; Set cursor to column 0 of line 2.
-LCD_LINE2:
+PRAC_3_LINE2:
     MOVLW   0xC0
-    CALL    LCD_CMD
+    CALL    PRAC_3_CMD
     RETURN
 
-; --- LCD_PRINT_HEX ---
+; --- PRAC_3_PRINT_HEX ---
 ; Print byte in W as two ASCII hex digits (e.g. 0x4F -> "4F").
-; Uses lcd_temp3_var to survive the nested LCD_CHAR calls.
-LCD_PRINT_HEX:
+; Uses lcd_temp3_var to survive the nested PRAC_3_CHAR calls.
+PRAC_3_PRINT_HEX:
     MOVWF   lcd_temp3_var, a        ; save full byte
     SWAPF   lcd_temp3_var, W, a
     ANDLW   0x0F
-    CALL    _LCD_HEX_DIGIT          ; high nibble
+    CALL    _PRAC_3_HEX_DIGIT          ; high nibble
     MOVF    lcd_temp3_var, W, a
     ANDLW   0x0F
-    CALL    _LCD_HEX_DIGIT          ; low nibble
+    CALL    _PRAC_3_HEX_DIGIT          ; low nibble
     RETURN
 
-; Convert nibble in W[3:0] to ASCII and send via LCD_CHAR.
-_LCD_HEX_DIGIT:
+; Convert nibble in W[3:0] to ASCII and send via PRAC_3_CHAR.
+_PRAC_3_HEX_DIGIT:
     ANDLW   0x0F
     MOVWF   lcd_temp_var, a         ; save nibble (0-15)
     MOVLW   0x0A
     CPFSLT  lcd_temp_var, a         ; skip if nibble < 10
-    BRA     _LCD_HD_LETTER
+    BRA     _PRAC_3_HD_LETTER
     MOVF    lcd_temp_var, W, a
     ADDLW   0x30                    ; '0'-'9'
-    BRA     _LCD_HD_SEND
-_LCD_HD_LETTER:
+    BRA     _PRAC_3_HD_SEND
+_PRAC_3_HD_LETTER:
     MOVF    lcd_temp_var, W, a
     ADDLW   0x37                    ; 'A'-'F'
-_LCD_HD_SEND:
-    CALL    LCD_CHAR
+_PRAC_3_HD_SEND:
+    CALL    PRAC_3_CHAR
     RETURN
 
-; --- _LCD_SEND_NIBBLE ---
+; --- _PRAC_3_SEND_NIBBLE ---
 ; Send nibble in W[3:0] to LCD (RS already set in LATD[3]).
 ; bit0->D4->RD5  bit1->D5->RD6  bit2->D6->RD7  bit3->D7->RB3
 ; Strobes E (RD4) high then low.
-_LCD_SEND_NIBBLE:
+_PRAC_3_SEND_NIBBLE:
     MOVWF   lcd_temp_var, a         ; save nibble
     ; LATD[7:5] = nibble[2:0]: clear data bits, then shift in
     MOVLW   0x1F
@@ -2350,44 +2356,44 @@ _LCD_SEND_NIBBLE:
     BCF     LATD, 4, a
     RETURN
 
-; --- _LCD_DELAY_50US ---
+; --- _PRAC_3_DELAY_50US ---
 ; ~50 �s busy-wait (covers 37 �s HD44780 command execution time).
-_LCD_DELAY_50US:
+_PRAC_3_DELAY_50US:
     MOVLW   0x0D                    ; 13 x 4 cycles = 52 �s
     MOVWF   lcd_temp_var, a
-_LCD_D50_L:
+_PRAC_3_D50_L:
     DECFSZ  lcd_temp_var, f, a
-    BRA     _LCD_D50_L
+    BRA     _PRAC_3_D50_L
     RETURN
 
-; --- _LCD_DELAY_2MS ---
+; --- _PRAC_3_DELAY_2MS ---
 ; ~2 ms (Clear Display / Return Home execution time).
-_LCD_DELAY_2MS:
+_PRAC_3_DELAY_2MS:
     MOVLW   0x03                    ; 3 outer x 250 inner x 3 cycles ~ 2.3 ms
     MOVWF   lcd_temp2_var, a
-_LCD_D2MS_OUT:
+_PRAC_3_D2MS_OUT:
     MOVLW   0xFA
     MOVWF   lcd_temp_var, a
-_LCD_D2MS_IN:
+_PRAC_3_D2MS_IN:
     DECFSZ  lcd_temp_var, f, a
-    BRA     _LCD_D2MS_IN
+    BRA     _PRAC_3_D2MS_IN
     DECFSZ  lcd_temp2_var, f, a
-    BRA     _LCD_D2MS_OUT
+    BRA     _PRAC_3_D2MS_OUT
     RETURN
 
-; --- _LCD_DELAY_5MS ---
+; --- _PRAC_3_DELAY_5MS ---
 ; ~5 ms (init sequence inter-nibble spacing).
-_LCD_DELAY_5MS:
+_PRAC_3_DELAY_5MS:
     MOVLW   0x08                    ; 8 outer x 250 inner x 3 cycles ~ 6 ms
     MOVWF   lcd_temp2_var, a
-_LCD_D5MS_OUT:
+_PRAC_3_D5MS_OUT:
     MOVLW   0xFA
     MOVWF   lcd_temp_var, a
 _LCD_D5MS_IN:
     DECFSZ  lcd_temp_var, f, a
     BRA     _LCD_D5MS_IN
     DECFSZ  lcd_temp2_var, f, a
-    BRA     _LCD_D5MS_OUT
+    BRA     _PRAC_3_D5MS_OUT
     RETURN
 
 

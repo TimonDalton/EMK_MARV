@@ -8,17 +8,11 @@ CONFIG  LVP    = ON
 #include <xc.inc>
 #include "pic18f45k22.inc"
 
-; MARV Interface Demo — UART + internal EEPROM + HD44780 LCD
+; MARV Interface Demo — UART + internal EEPROM + SSD
 ;
 ; PORT MAPPING
 ;   UART:
 ;     TX  -> RC6   RX  -> RC7
-;   LCD HD44780 (4-bit mode):
-;     RS  -> RD3   E   -> RD4
-;     D4  -> RD5   D5  -> RD6   D6  -> RD7   D7  -> RB3
-;     VSS -> GND   VDD -> 5V    V0  -> contrast pot   RW  -> GND
-;     D0-D3 -> GND
-;     A (bklt+) -> 5V / 100R   K (bklt-) -> GND
 ;   SSD (common-anode on PORTA, 1 = segment on via inverting driver):
 ;     a -> RA0   b -> RA1   c -> RA2   d -> RA3
 ;     e -> RA4   f -> RA5   g -> RA6
@@ -53,6 +47,12 @@ SSD_3    EQU 0x4F    ; abcdg
 SSD_4    EQU 0x66    ; bcfg
 SSD_5    EQU 0x6D    ; acdfg
 
+; ---- SSD race-colour letters (while racing) ----
+r_SSD    EQU 0b00110001    ; Red   (matches marv.s)
+G_SSD    EQU 0b01111101    ; Green
+b_SSD    EQU 0b01111100    ; Blue  (lowercase b)
+k_SSD    EQU 0b01110110    ; blacK (H-like approximation)
+
 ; ---- RAM variables (bank 0 access, 0x00-0x5F) ----
 delay1          EQU 0x00
 delay2          EQU 0x01
@@ -62,9 +62,6 @@ temp_var        EQU 0x04    ; general scratch
 ee_addr_var     EQU 0x05    ; EEPROM address for current operation
 ssd_out_var     EQU 0x06    ; SSD segment pattern
 race_col_var    EQU 0x07    ; 'R' 'G' 'B' or 'k' (ASCII race colour)
-lcd_temp_var    EQU 0x08
-lcd_temp2_var   EQU 0x09
-lcd_temp3_var   EQU 0x0A
 
 ; ---- Macro: load TBLPTR with 24-bit program-memory address ----
 LOAD_TBLPTR MACRO addr
@@ -96,24 +93,16 @@ Init:
     CLRF    TRISA, a
     CLRF    PORTA, a
 
-    ; PORTB — RB3 = LCD D7 output
+    ; PORTB — disable analog
     MOVLB   0xF
     CLRF    ANSELB, b
     MOVLB   0x0
-    BCF     TRISB, 3, a
 
     ; PORTC — RC7 = RX input; EUSART controls RC6 (TX)
     MOVLB   0xF
     CLRF    ANSELC, b
     MOVLB   0x0
     BSF     TRISC, 7, a
-
-    ; PORTD — all outputs (LCD)
-    MOVLB   0xF
-    CLRF    ANSELD, b
-    MOVLB   0x0
-    CLRF    TRISD, a
-    CLRF    LATD, a
 
     ; PORTE — not used
     MOVLB   0xF
@@ -129,9 +118,6 @@ Init:
     MOVLW   25
     MOVWF   SPBRG, a
 
-    ; LCD power-on init
-    CALL    LCD_INIT
-
     ; First-run EEPROM init
     MOVLW   EE_SENTINEL_ADDR
     CALL    EE_READ
@@ -140,7 +126,7 @@ Init:
     CALL    EE_WRITE_DEFAULTS
 _INIT_EE_SKIP:
 
-    ; Default state = ATTACK; show greeting; update SSD + LCD
+    ; Default state = ATTACK; show greeting; update SSD
     MOVLW   'R'
     MOVWF   race_col_var, a         ; default race colour = Red
     CALL    UART_TX_CRLF
@@ -225,12 +211,6 @@ ENTER_MAIN_MODE:
     CALL    UART_TX_CRLF
     MOVLW   EE_MENU_ADDR
     CALL    UART_TX_EE_STR
-    CALL    LCD_LINE1
-    LOAD_TBLPTR LCD_STR_MAIN1
-    CALL    LCD_PRINT_ROM_STR
-    CALL    LCD_LINE2
-    LOAD_TBLPTR LCD_STR_MAIN2
-    CALL    LCD_PRINT_ROM_STR
     RETURN
 
 ENTER_ATTACK_MODE:
@@ -243,12 +223,6 @@ ENTER_ATTACK_MODE:
     MOVF    race_col_var, W, a
     CALL    UART_TX               ; print race colour letter
     CALL    UART_TX_CRLF
-    CALL    LCD_LINE1
-    LOAD_TBLPTR LCD_STR_ATK1
-    CALL    LCD_PRINT_ROM_STR
-    CALL    LCD_LINE2
-    LOAD_TBLPTR LCD_STR_ATK2
-    CALL    LCD_PRINT_ROM_STR
     RETURN
 
 ENTER_COL_MODE:
@@ -258,12 +232,6 @@ ENTER_COL_MODE:
     CALL    SET_SSD
     LOAD_TBLPTR UART_STR_COL
     CALL    UART_TX_ROM_STR
-    CALL    LCD_LINE1
-    LOAD_TBLPTR LCD_STR_COL1
-    CALL    LCD_PRINT_ROM_STR
-    CALL    LCD_LINE2
-    LOAD_TBLPTR LCD_STR_COL2
-    CALL    LCD_PRINT_ROM_STR
     RETURN
 
 ENTER_REF_MODE:
@@ -273,12 +241,6 @@ ENTER_REF_MODE:
     CALL    SET_SSD
     LOAD_TBLPTR UART_STR_REF
     CALL    UART_TX_ROM_STR
-    CALL    LCD_LINE1
-    LOAD_TBLPTR LCD_STR_REF1
-    CALL    LCD_PRINT_ROM_STR
-    CALL    LCD_LINE2
-    LOAD_TBLPTR LCD_STR_REF2
-    CALL    LCD_PRINT_ROM_STR
     RETURN
 
 ENTER_SIM_MODE:
@@ -288,12 +250,6 @@ ENTER_SIM_MODE:
     CALL    SET_SSD
     LOAD_TBLPTR UART_STR_SIM
     CALL    UART_TX_ROM_STR
-    CALL    LCD_LINE1
-    LOAD_TBLPTR LCD_STR_SIM1
-    CALL    LCD_PRINT_ROM_STR
-    CALL    LCD_LINE2
-    LOAD_TBLPTR LCD_STR_SIM2
-    CALL    LCD_PRINT_ROM_STR
     RETURN
 
 ENTER_HOT_MODE:
@@ -301,12 +257,6 @@ ENTER_HOT_MODE:
     MOVWF   state_var, a
     MOVLW   SSD_5
     CALL    SET_SSD
-    CALL    LCD_LINE1
-    LOAD_TBLPTR LCD_STR_HOT1
-    CALL    LCD_PRINT_ROM_STR
-    CALL    LCD_LINE2
-    LOAD_TBLPTR LCD_STR_HOT2
-    CALL    LCD_PRINT_ROM_STR
     CALL    DO_HOTLOAD
     ; Return to main menu automatically after hotload
     CALL    ENTER_MAIN_MODE
@@ -534,185 +484,6 @@ SET_SSD:
     RETURN
 
 ; ============================================================
-; LCD HD44780 driver — 4-bit mode
-; Pins: RS=RD3  E=RD4  D4=RD5  D5=RD6  D6=RD7  D7=RB3
-; ============================================================
-
-LCD_INIT:
-    BCF     LATD, 3, a
-    BCF     LATD, 4, a
-    BCF     LATB, 3, a
-    MOVLW   0x1F
-    ANDWF   LATD, f, a
-    CALL    _LCD_DELAY_40MS
-    MOVLW   0x03
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
-    MOVLW   0x03
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
-    MOVLW   0x03
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
-    MOVLW   0x02
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_5MS
-    MOVLW   0x28                    ; 4-bit, 2-line, 5x8
-    CALL    LCD_CMD
-    MOVLW   0x0C                    ; display on, cursor off
-    CALL    LCD_CMD
-    MOVLW   0x06                    ; entry mode: increment
-    CALL    LCD_CMD
-    CALL    LCD_CLEAR
-    RETURN
-
-LCD_CMD:
-    MOVWF   lcd_temp2_var, a
-    BCF     LATD, 3, a              ; RS = 0
-    SWAPF   lcd_temp2_var, W, a
-    ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_50US
-    MOVF    lcd_temp2_var, W, a
-    ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_50US
-    RETURN
-
-LCD_CHAR:
-    MOVWF   lcd_temp2_var, a
-    BSF     LATD, 3, a              ; RS = 1
-    SWAPF   lcd_temp2_var, W, a
-    ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_50US
-    MOVF    lcd_temp2_var, W, a
-    ANDLW   0x0F
-    CALL    _LCD_SEND_NIBBLE
-    CALL    _LCD_DELAY_50US
-    BCF     LATD, 3, a
-    RETURN
-
-LCD_CLEAR:
-    MOVLW   0x01
-    CALL    LCD_CMD
-    CALL    _LCD_DELAY_2MS
-    RETURN
-
-LCD_LINE1:
-    MOVLW   0x80
-    CALL    LCD_CMD
-    RETURN
-
-LCD_LINE2:
-    MOVLW   0xC0
-    CALL    LCD_CMD
-    RETURN
-
-; LCD_PRINT_ROM_STR: print null-terminated string from TBLPTR via LCD
-LCD_PRINT_ROM_STR:
-    TBLRD*+
-    MOVF    TABLAT, W, a
-    BZ      _LPRS_DONE
-    CALL    LCD_CHAR
-    BRA     LCD_PRINT_ROM_STR
-_LPRS_DONE:
-    RETURN
-
-; LCD_PRINT_HEX: print W as two ASCII hex digits
-LCD_PRINT_HEX:
-    MOVWF   lcd_temp3_var, a
-    SWAPF   lcd_temp3_var, W, a
-    ANDLW   0x0F
-    CALL    _LCD_HEX_DIGIT
-    MOVF    lcd_temp3_var, W, a
-    ANDLW   0x0F
-    CALL    _LCD_HEX_DIGIT
-    RETURN
-
-_LCD_HEX_DIGIT:
-    ANDLW   0x0F
-    MOVWF   lcd_temp_var, a
-    MOVLW   0x0A
-    CPFSLT  lcd_temp_var, a
-    BRA     _LHD_LETTER
-    MOVF    lcd_temp_var, W, a
-    ADDLW   0x30
-    BRA     _LHD_SEND
-_LHD_LETTER:
-    MOVF    lcd_temp_var, W, a
-    ADDLW   0x37
-_LHD_SEND:
-    CALL    LCD_CHAR
-    RETURN
-
-_LCD_SEND_NIBBLE:
-    MOVWF   lcd_temp_var, a
-    MOVLW   0x1F
-    ANDWF   LATD, f, a              ; preserve LATD[4:0]
-    MOVF    lcd_temp_var, W, a
-    ANDLW   0x07                    ; bits[2:0] -> D6,D5,D4
-    SWAPF   WREG, W, a              ; shift to [6:4]
-    BCF     STATUS, 0, a
-    RLCF    WREG, W, a              ; shift to [7:5]
-    IORWF   LATD, f, a
-    BCF     LATB, 3, a
-    BTFSC   lcd_temp_var, 3, a
-    BSF     LATB, 3, a
-    BSF     LATD, 4, a              ; E high
-    NOP
-    NOP
-    BCF     LATD, 4, a              ; E low
-    RETURN
-
-_LCD_DELAY_50US:
-    MOVLW   0x0D
-    MOVWF   lcd_temp_var, a
-_LD50_L:
-    DECFSZ  lcd_temp_var, f, a
-    BRA     _LD50_L
-    RETURN
-
-_LCD_DELAY_2MS:
-    MOVLW   0x03
-    MOVWF   lcd_temp2_var, a
-_LD2_OUT:
-    MOVLW   0xFA
-    MOVWF   lcd_temp_var, a
-_LD2_IN:
-    DECFSZ  lcd_temp_var, f, a
-    BRA     _LD2_IN
-    DECFSZ  lcd_temp2_var, f, a
-    BRA     _LD2_OUT
-    RETURN
-
-_LCD_DELAY_5MS:
-    MOVLW   0x08
-    MOVWF   lcd_temp2_var, a
-_LD5_OUT:
-    MOVLW   0xFA
-    MOVWF   lcd_temp_var, a
-_LD5_IN:
-    DECFSZ  lcd_temp_var, f, a
-    BRA     _LD5_IN
-    DECFSZ  lcd_temp2_var, f, a
-    BRA     _LD5_OUT
-    RETURN
-
-_LCD_DELAY_40MS:
-    MOVLW   0x6C
-    MOVWF   delay1, a
-_LD40_OUT:
-    MOVLW   0xFF
-    MOVWF   delay2, a
-_LD40_IN:
-    DECFSZ  delay2, f, a
-    BRA     _LD40_IN
-    DECFSZ  delay1, f, a
-    BRA     _LD40_OUT
-    RETURN
-
-; ============================================================
 ; String data in program memory
 ; ============================================================
     org 0x0800
@@ -762,42 +533,5 @@ UART_STR_HOT_PROMPT:
 
 UART_STR_HOT_DONE:
     db  "Slogan saved to EEPROM.\r\n", 0
-
-; LCD strings — 16 chars padded with spaces to fill display width
-LCD_STR_MAIN1:
-    db  "  Main Menu     ", 0
-
-LCD_STR_MAIN2:
-    db  "Press C/R/A/S/H ", 0
-
-LCD_STR_ATK1:
-    db  "** MARV ATTACK *", 0
-
-LCD_STR_ATK2:
-    db  "  Ready to race ", 0
-
-LCD_STR_COL1:
-    db  "Colour Selection", 0
-
-LCD_STR_COL2:
-    db  "  R / G / B / k ", 0
-
-LCD_STR_REF1:
-    db  " Reference Mode ", 0
-
-LCD_STR_REF2:
-    db  " Calibrating... ", 0
-
-LCD_STR_SIM1:
-    db  " Simulate Mode  ", 0
-
-LCD_STR_SIM2:
-    db  " S / F / L / R  ", 0
-
-LCD_STR_HOT1:
-    db  "Hotload EEPROM  ", 0
-
-LCD_STR_HOT2:
-    db  "Type + Enter    ", 0
 
     end
