@@ -54,8 +54,11 @@ BLACK_COL            EQU 0x04
 SSD_RED              EQU 0x50
 SSD_GREEN            EQU 0x3D
 SSD_BLUE             EQU 0x7C
-SSD_BLACK            EQU 0x40
+SSD_BLACK            EQU 0b10000000
 SSD_BLANK            EQU 0x00
+	    
+	    
+DISP_LED_PORT      equ PORTB; <5:7> R,G,B
 
 
 PSECT code,abs
@@ -162,8 +165,13 @@ Init:
     CLRF    PORTB, a
     CLRF    LATB, a
     CLRF    ANSELB, b
+    
     BSF     TRISB, 0, a             ; RB0 input (yellow)
     BSF     TRISB, 1, a             ; RB1 input (red)
+    
+    BCF        TRISB,5,a;DISP LED OUTPUTS
+    BCF        TRISB,6,a
+    BCF        TRISB,7,a
 
     ; PORTC: UART
     CLRF    ANSELC, b
@@ -214,7 +222,6 @@ Main:
     ; Flash phase toggle: alternate SSD ON/OFF each pass
     BTG     flash_phase_var, 0, a
     BTFSS   flash_phase_var, 0, a
-    BRA     MAIN_SSD_OFF
     CALL    SET_SSD_TO_RACE_COL
     BRA     MAIN_POLL
 MAIN_SSD_OFF:
@@ -285,18 +292,22 @@ SET_SSD_TO_RACE_COL:
 SSD_R:
     MOVLW   SSD_RED
     MOVWF   PORTA, a
+    call    set_disp_rgb_red
     RETURN
 SSD_G:
     MOVLW   SSD_GREEN
     MOVWF   PORTA, a
+    call    set_disp_rgb_green
     RETURN
 SSD_B:
     MOVLW   SSD_BLUE
     MOVWF   PORTA, a
+    call    set_disp_rgb_blue
     RETURN
 SSD_K:
     MOVLW   SSD_BLACK
     MOVWF   PORTA, a
+    call    set_disp_rgb_black
     RETURN
 
 
@@ -472,4 +483,35 @@ D1S_L3:
     BRA     D1S_L1
     RETURN
 
+    
+set_disp_rgb_red: ;B<5:7> = R,G,B
+    BSF        DISP_LED_PORT,5,a
+    BCF        DISP_LED_PORT,6,a
+    BCF        DISP_LED_PORT,7,a
+    return
+    
+set_disp_rgb_green: ;B<5:7> = R,G,B
+    BCF        DISP_LED_PORT,5,a
+    BSF        DISP_LED_PORT,6,a
+    BCF        DISP_LED_PORT,7,a
+    return
+    
+set_disp_rgb_blue: ;B<5:7> = R,G,B
+    BCF        DISP_LED_PORT,5,a
+    BCF        DISP_LED_PORT,6,a
+    BSF        DISP_LED_PORT,7,a
+    return
+    
+set_disp_rgb_white: ;B<5:7> = R,G,B
+    BSF        DISP_LED_PORT,5,a
+    BSF        DISP_LED_PORT,6,a
+    BSF        DISP_LED_PORT,7,a
+    return
+    
+set_disp_rgb_black: ;B<5:7> = R,G,B
+    BCF        DISP_LED_PORT,5,a
+    BCF        DISP_LED_PORT,6,a
+    BCF        DISP_LED_PORT,7,a
+    return
+    
     end

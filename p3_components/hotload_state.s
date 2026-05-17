@@ -1,13 +1,12 @@
-; eeprom_portd_test.s — single-line EEPROM seeder (debug revert: Enter commits).
+; hotload_state.s — single-line EEPROM rewrite (H-mode prototype).
+;
+; Forked from eeprom_portd_test.s with debug instrumentation stripped.
 ;
 ; Loop:
 ;   1. Read EEPROM[0..] sequentially until CR (0x0D) or 0xFF, echo to UART
-;   2. Print "Enter String:\n"
+;   2. Print "Enter String:\r\n"
 ;   3. Read UART input. Enter (CR) is stored AND ends input.
 ;   4. Byte-write the buffered content (including the trailing CR) to EEPROM
-;
-; After [WRITTEN] a diagnostic prints "[b0=X]" reading EEPROM[0] directly to
-; confirm the write persisted.
 ;
 ; Pin assignments:
 ;   RC3 = SCL, RC4 = SDA (I2C / MSSP1, 24LC16B EEPROM)
@@ -28,11 +27,9 @@ TX_BYTE     EQU 0x00
 Delay1      EQU 0x01
 Delay2      EQU 0x02
 Delay3      EQU 0x03
-NACK_COUNT  EQU 0x08            ; counts NACKs across one URW_BYTE_LOOP run
 ADDR        EQU 0x04            ; running byte count (8-bit, wraps to 0 at 256)
 RX_BYTE     EQU 0x05
-CUR_ADDR    EQU 0x06            ; current EEPROM word address for page write
-BTS_PAGE    EQU 0x07            ; bytes to write this page (1..16)
+CUR_ADDR    EQU 0x06            ; current EEPROM word address for byte-by-byte write
 
 WRITE_CTRL  EQU 10100000B
 READ_CTRL   EQU 10100001B
@@ -86,21 +83,12 @@ Start:
     CALL    DELAY_1S
     CALL    I2C_BUS_RECOVER
 
-    ; Extra startup delay + banner so the terminal can connect in time to see
-    ; the first EEPROM read. Without this, the very first EEPROM_READ_OUT
-    ; output gets transmitted before the host has the port open.
+    ; Startup delay so the terminal can attach before the first EEPROM read.
     CALL    DELAY_1S
     CALL    DELAY_1S
     CALL    PRINT_READY_BANNER
 
 MainLoop:
-    ; BREAKPOINT (one-time): pre-flight MSSP state check.
-    ;   SSP1CON1 (0xFC6) | report if NOT 0x28 (= SSPEN+SSPM=master not configured)
-    ;   SSP1CON2 (0xFC5) | report if NOT 0x00 (= a stale op bit is set)
-    ;   SSP1STAT (0xFC7) | report if NOT 0x80 (= SMP=1 + idle. P=S=0 between transactions)
-    ;   SSP1ADD  (0xFC8) | report if NOT 0x09 (= 100 kHz BRG corrupted)
-    ;   TRISC    (0xF94) | report if RC3 (bit 3) OR RC4 (bit 4) is NOT 1 (= MSSP can't drive open-drain)
-    ;   PORTC    (0xF82) | report if RC3 OR RC4 is NOT 1 (= bus not idling high)
     CALL    EEPROM_READ_OUT
     CALL    UART_CRLF
     CALL    PRINT_PROMPT
@@ -114,22 +102,17 @@ EEPROM_READ_OUT:
     MOVLW   WRITE_CTRL
     MOVWF   TX_BYTE, a
     CALL    I2C_WRITE
-    ; BREAKPOINT: read-setup control byte 0xA0 sent. SSP1CON2 (0xFC5) bit 6 (ACKSTAT) | report if NOT 0
     MOVLW   0x00                ; word address 0
     MOVWF   TX_BYTE, a
     CALL    I2C_WRITE
-    ; BREAKPOINT: read-setup address sent. SSP1CON2 bit 6 (ACKSTAT) | report if NOT 0
     CALL    I2C_RESTART_COND
     MOVLW   READ_CTRL
     MOVWF   TX_BYTE, a
     CALL    I2C_WRITE
-    ; BREAKPOINT: read control byte 0xA1 sent. SSP1CON2 bit 6 (ACKSTAT) | report if NOT 0
 
     CLRF    ADDR, a             ; byte counter
 ERO_LOOP:
     CALL    I2C_READ_BYTE       ; result in TX_BYTE
-    ; BREAKPOINT (first iteration only): byte just read from EEPROM[0].
-    ;   TX_BYTE (0x00) | report value. 0xFF = no slave on bus. 0x0D = stored CR. Anything else = real data.
     MOVF    TX_BYTE, W, a
     XORLW   TERMINATOR
     BZ      ERO_NACK
@@ -165,7 +148,7 @@ ERO_NACK:
 ERO_DONE:
     RETURN
 
-; ---- Read UART into buffer with echo, then multi-page-write to EEPROM ----
+; ---- Read UART into buffer, then byte-by-byte write to EEPROM ----
 
 UART_READ_WRITE:
     LFSR    0, 0x100            ; buffer base
@@ -187,124 +170,24 @@ URW_DONE_READING:
     ; (Reliable for any length up to 256; takes ~10 ms per byte.)
     LFSR    0, 0x100
     CLRF    CUR_ADDR, a
-    CLRF    NACK_COUNT, a       ; reset NACK counter for this write session
 URW_BYTE_LOOP:
     CALL    I2C_START_COND
-    ; BREAKPOINT: after START. Check SSP1STAT (0xFC7) bit 3 (S) | report if NOT 1 (= START not detected)
-    ; Also check PORTC (0xF82) bit 4 (SDA) | report if NOT 0 (after START, SDA should be held low by master)
     MOVLW   WRITE_CTRL
     MOVWF   TX_BYTE, a
     CALL    I2C_WRITE
-    ; BREAKPOINT: after control byte 0xA0. Check SSP1CON2 (0xFC5) bit 6 (ACKSTAT) | report if NOT 0 (= chip NACKed its address)
     MOVF    CUR_ADDR, W, a
     MOVWF   TX_BYTE, a
     CALL    I2C_WRITE
-    ; BREAKPOINT: after word address byte. Check SSP1CON2 (0xFC5) bit 6 (ACKSTAT) | report if NOT 0 (= chip rejected address)
     MOVF    POSTINC0, W, a
     MOVWF   TX_BYTE, a
     CALL    I2C_WRITE
-    ; BREAKPOINT: after data byte. Check SSP1CON2 (0xFC5) bit 6 (ACKSTAT) | report if NOT 0 (= chip rejected data)
-    ; Also check SSP1CON1 (0xFC6) bit 7 (WCOL) | report if NOT 0 (= write collision occurred)
     CALL    I2C_STOP_COND
-    ; BREAKPOINT: after STOP. Check SSP1STAT (0xFC7) bit 4 (P) | report if NOT 1 (= STOP not detected)
-    ; Also check SSP1CON2 (0xFC5) | report if NOT 0x00 (any op bits stuck — PEN/RSEN/SEN/RCEN should all be 0)
     CALL    DELAY_10MS
     INCF    CUR_ADDR, F, a
     MOVF    CUR_ADDR, W, a
     CPFSEQ  ADDR, a             ; done when CUR_ADDR == ADDR (handles 256-byte wrap too)
     BRA     URW_BYTE_LOOP
-    ; Visible commit confirmation
-    MOVLW   '['
-    CALL    UART_TX
-    MOVLW   'W'
-    CALL    UART_TX
-    MOVLW   'R'
-    CALL    UART_TX
-    MOVLW   'I'
-    CALL    UART_TX
-    MOVLW   'T'
-    CALL    UART_TX
-    MOVLW   'T'
-    CALL    UART_TX
-    MOVLW   'E'
-    CALL    UART_TX
-    MOVLW   'N'
-    CALL    UART_TX
-    MOVLW   ']'
-    CALL    UART_TX
-    CALL    UART_CRLF
-    ; Print "[N=X]" — total NACKs received across the write session
-    MOVLW   '['
-    CALL    UART_TX
-    MOVLW   'N'
-    CALL    UART_TX
-    MOVLW   '='
-    CALL    UART_TX
-    MOVF    NACK_COUNT, W, a
-    ADDLW   '0'                 ; assume < 10 for now (5 bytes typed -> max 15 NACKs)
-    CALL    UART_TX
-    MOVLW   ']'
-    CALL    UART_TX
-    CALL    UART_CRLF
-    ; Diagnostic: read back EEPROM[0] immediately to confirm write persisted
-    GOTO    DIAG_READBACK_BYTE_0
-
-; Reads EEPROM[0], prints "[b0=X]" where X is the byte value (FF/`/raw char).
-DIAG_READBACK_BYTE_0:
-    CALL    I2C_START_COND
-    MOVLW   WRITE_CTRL
-    MOVWF   TX_BYTE, a
-    CALL    I2C_WRITE
-    ; BREAKPOINT: after read-setup control byte 0xA0. Check SSP1CON2 (0xFC5) bit 6 (ACKSTAT) | report if NOT 0
-    MOVLW   0x00
-    MOVWF   TX_BYTE, a
-    CALL    I2C_WRITE
-    ; BREAKPOINT: after read-setup address byte. Check SSP1CON2 (0xFC5) bit 6 (ACKSTAT) | report if NOT 0
-    CALL    I2C_RESTART_COND
-    ; BREAKPOINT: after RESTART. Check SSP1STAT (0xFC7) bit 3 (S) | report if NOT 1
-    MOVLW   READ_CTRL
-    MOVWF   TX_BYTE, a
-    CALL    I2C_WRITE
-    ; BREAKPOINT: after read control byte 0xA1. Check SSP1CON2 (0xFC5) bit 6 (ACKSTAT) | report if NOT 0
-    CALL    I2C_READ_BYTE
-    ; BREAKPOINT: after byte received. Check TX_BYTE (0x00) | report value read
-    ;             0xFF = no slave on bus (just pull-up). Anything else = chip drove SDA.
-    CALL    I2C_SEND_NACK
-    CALL    I2C_STOP_COND
-
-    MOVLW   '['
-    CALL    UART_TX
-    MOVLW   'b'
-    CALL    UART_TX
-    MOVLW   '0'
-    CALL    UART_TX
-    MOVLW   '='
-    CALL    UART_TX
-    ; Discriminate special values for readability
-    MOVF    TX_BYTE, W, a
-    XORLW   0xFF
-    BZ      DIAG_FF
-    MOVF    TX_BYTE, W, a
-    XORLW   0x0D
-    BZ      DIAG_CR
-    MOVF    TX_BYTE, W, a
-    CALL    UART_TX
-    BRA     DIAG_CLOSE
-DIAG_FF:
-    MOVLW   'F'
-    CALL    UART_TX
-    MOVLW   'F'
-    CALL    UART_TX
-    BRA     DIAG_CLOSE
-DIAG_CR:
-    MOVLW   'C'
-    CALL    UART_TX
-    MOVLW   'R'
-    CALL    UART_TX
-DIAG_CLOSE:
-    MOVLW   ']'
-    CALL    UART_TX
-    GOTO    UART_CRLF
+    RETURN
 
 ; ---- "Enter String:\r\n" ----
 
@@ -467,9 +350,6 @@ I2C_WRITE:
 Wait_WRITE:
     BTFSS   SSP1IF
     BRA     Wait_WRITE
-    ; If slave NACKed (ACKSTAT=1), bump the count
-    BTFSC   SSP1CON2, 6, a
-    INCF    NACK_COUNT, F, a
     RETURN
 
 I2C_READ_BYTE:                  ; receive byte to TX_BYTE; does NOT send ACK/NACK
