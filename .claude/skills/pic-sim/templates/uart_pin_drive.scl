@@ -1,0 +1,38 @@
+// UART RX bit-banged on RC7 at 9600 baud (104.17 us per bit).
+// Use when you want to exercise the full EUSART hardware including framing.
+// Sends byte 'A' (0x41 = 0b01000001) — LSB first: 1,0,0,0,0,0,1,0
+//   start=0, b0=1, b1=0, b2=0, b3=0, b4=0, b5=0, b6=1, b7=0, stop=1
+
+configuration {
+    module := PIC18F45K22;
+};
+
+testbench for PIC18F45K22 is
+begin
+    process is
+    begin
+        wait for 5 ms;
+        // idle line high
+        drive RC7 to '1';
+
+        // start bit
+        drive RC7 to '0';
+        wait for 104167 ns;
+
+        // data bits (LSB first) for 'A' = 0x41
+        drive RC7 to '1'; wait for 104167 ns;  // b0
+        drive RC7 to '0'; wait for 104167 ns;  // b1
+        drive RC7 to '0'; wait for 104167 ns;  // b2
+        drive RC7 to '0'; wait for 104167 ns;  // b3
+        drive RC7 to '0'; wait for 104167 ns;  // b4
+        drive RC7 to '0'; wait for 104167 ns;  // b5
+        drive RC7 to '1'; wait for 104167 ns;  // b6
+        drive RC7 to '0'; wait for 104167 ns;  // b7
+
+        // stop bit
+        drive RC7 to '1';
+        wait for 104167 ns;
+
+        wait;
+    end process;
+end testbench;

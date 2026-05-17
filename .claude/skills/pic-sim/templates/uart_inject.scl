@@ -1,0 +1,30 @@
+// UART RX byte injection — fires bytes directly into RCREG1 at scheduled times.
+// Bypasses real bit-timing on RC7. Best for verifying menu dispatch logic.
+
+configuration {
+    module := PIC18F45K22;
+};
+
+testbench for PIC18F45K22 is
+begin
+    process is
+    begin
+        wait for 5 ms;
+        message ("inject 'A'");
+        inject 'A' into RCREG1;
+
+        wait for 50 ms;
+        message ("inject 'C'");
+        inject 'C' into RCREG1;
+
+        wait for 50 ms;
+        message ("inject 'R'");
+        inject 'R' into RCREG1;
+
+        wait for 50 ms;
+        message ("inject 'M' (CYOC)");
+        inject 'M' into RCREG1;
+
+        wait;
+    end process;
+end testbench;

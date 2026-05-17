@@ -10,7 +10,7 @@ import matplotlib.animation as animation
 from matplotlib.widgets import Button, TextBox
 import serial
 
-PORT    = '/dev/tty.usbserial-0001'
+PORT    = '/dev/cu.usbserial-0001'
 BAUD    = 9600
 LABELS  = ['L_R','L_G','L_B','C_R','C_G','C_B','R_R','R_G','R_B']
 HISTORY = 100

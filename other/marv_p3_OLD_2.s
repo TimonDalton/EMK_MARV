@@ -21,6 +21,9 @@ STROBE_LED_PORT      equ PORTD; <0:2> R,G,B
      ;Buttons     PORTB; <0:1> L,R
      ;Sensors     PORTE; <0:2> L,C,R
      ;Motors	  PORTC; <0:3>
+     ;LCD HD44780  PORTD; <3:7> RS,E,D4,D5,D6 | PORTB; <3> D7
+     ;  VSS->GND  VDD->5V  V0->contrast-pot  RW->GND  D0-D3->GND
+     ;  A(bklt+)->5V/100R  K(bklt-)->GND
     
 ;============== Definition of variables ===============
 ; =========================
@@ -125,11 +128,22 @@ touch_sample1_var                       EQU 0x4D    ; 16-sample accumulator high
 touch_sample2_var                       EQU 0x4E    ; 16-sample accumulator low / result
 touch_sample3_var                       EQU 0x4F    ; sample loop counter / delta temp
 
+lcd_temp_var                            EQU 0x50    ; generic scratch (PRAC_3_PRINT_HEX nibble)
+lcd_temp2_var                           EQU 0x51    ; generic scratch (PRAC_3 delays)
+lcd_temp3_var                           EQU 0x52    ; PRAC_3_PRINT_HEX byte save
+
+; ---- P3 UART / menu state ----
+uart_rx_var                             EQU 0x53    ; last received UART byte
+uart_scratch_var                        EQU 0x54    ; UART_TX_ROM_STR / dispatch scratch
+sim_drive_var                           EQU 0x55    ; S-mode latched drive: 0=stop 1=F 2=L 3=R
+cap_poll_counter_var                    EQU 0x56    ; CAP_ADC_POLL bounded-loop counter
+sim_rx_pending_var                      EQU 0x57    ; sim-only: byte to feed UART_RX_NB (0 = hw)
+
 RACE_COL_var                            EQU 0x2B
 PERCEIVED_COLOUR_AT_SENSOR_BITS_var	EQU 0x3C
 DRIVING_STATE_var                       EQU 0x2C
 DRIVING_STATE_SSD_DISPLAY_var		EQU 0x3D
-		
+
 black_confirm_count_var			EQU 0x3F
 prev_driving_state_var			EQU 0x40
 
@@ -227,9 +241,11 @@ ADC_AN7       EQU  00011101B   ; RE2 = right sensor
 state_constants:
 selecting_state_val equ 0x0
 calibrating_state_val equ 0x1
-LLI_state_val equ 0x2
+LLI_state_val equ 0x2          ; Attack mode (race / line-line intersection)
 feedback_color_state_val equ 0x3
 osc_delay_state_val equ 0x5
+simulate_state_val equ 0x6     ; P3 (S)imulate mode
+hotload_state_val  equ 0x7     ; P3 (H)otload mode
  
 ;Calibration/Colour Detect/LLI Constants
 calibration_constants:
@@ -274,6 +290,20 @@ matching_floor_to_strobe_colour_reading_diff_multiplier_val equ    0x3
     upsidedown_U_SSD EQU 0b01101110
     CLEAR_SSD EQU 0x00
 
+    ; P3 mode digits (matches generic 7-seg encoding for "0".."5")
+    DIGIT_0_SSD EQU 0b00111111
+    DIGIT_1_SSD EQU 0b00000110
+    DIGIT_2_SSD EQU 0b01011011
+    DIGIT_3_SSD EQU 0b01001111
+    DIGIT_4_SSD EQU 0b01100110
+    DIGIT_5_SSD EQU 0b01101101
+
+    ; P3 race-colour letters (shown on SSD while racing)
+    ; r_SSD already defined above (lowercase r — Red)
+    G_SSD    EQU 0b01111101       ; Green (uppercase G; same shape as digit 6)
+    b_SSD    EQU 0b01111100       ; Blue  (lowercase b)
+    k_SSD    EQU 0b01110110       ; blacK (H-like approximation)
+
     ;</editor-fold>
 
     ;;RGB LED OUTPUTS
@@ -296,6 +326,15 @@ PWM_SPEED_STOP_val  equ 0       ; 0% ? motor off
 WFT_THRESH      equ 0x03    ; min delta (baseline-reading) to count as touch
 WFT_DEBOUNCE    equ 0x03    ; consecutive readings required for confirmation
 WFT_TIMEOUT     equ 0xC8    ; ~200 loops before timeout/baseline reset
+
+; ---- Macro: load TBLPTR with 24-bit program-memory address ----
+LOAD_TBLPTR MACRO addr
+    MOVLW   LOW(addr)
+    MOVWF   TBLPTRL, a
+    MOVLW   HIGH(addr)
+    MOVWF   TBLPTRH, a
+    CLRF    TBLPTRU, a
+    ENDM
 	
 
  
@@ -452,7 +491,8 @@ Init:
     BCF        TRISB,5,a
     BCF        TRISB,6,a
     BCF        TRISB,7,a
-
+    BCF        TRISB,3,a           ; RB3 = output (LCD D7)
+    
     CLRF    TRISD, a
     CLRF    PORTD, a
     
@@ -478,6 +518,9 @@ Init:
     MOVLB        0x00
     
     CLRF    must_navigate_to_var,a
+    CLRF    sim_rx_pending_var, a       ; P3: sim-only RX hook — must be 0 on hardware
+    CLRF    uart_rx_var, a
+    CLRF    uart_scratch_var, a
     ;Default values for sensor cal.
     ;<editor-fold defaultstate="collapsed" desc="SENSOR CAL DEFAULT VALUES">
     ; Real measurements ? sensor_plot.py dump 2026-04-11
@@ -621,6 +664,18 @@ Init:
     MOVLW   LOST_DRIVING_STATE_val
     MOVWF   DRIVING_STATE_var, a
 
+    ; ---- EUSART1 @ 9600 baud, 8N1 (RC6=TX, RC7=RX) ----
+    ; SPBRG=25, BRGH=1 -> 4 MHz / (16*(25+1)) = 9615 baud (~0.16% error)
+    BCF     TRISC, 6, a         ; RC6 = output (TX1)
+    BSF     TRISC, 7, a         ; RC7 = input  (RX1)
+    MOVLW   25
+    MOVWF   SPBRG1, a
+    MOVLW   00100100B           ; TXEN=1, BRGH=1, SYNC=0
+    MOVWF   TXSTA1, a
+    MOVLW   10010000B           ; SPEN=1, CREN=1 (continuous RX enabled)
+    MOVWF   RCSTA1, a
+    CLRF    BAUDCON1, a         ; BRG16=0
+
 ;</editor-fold>
 
 
@@ -629,8 +684,14 @@ Init:
 
 ;============ Main program ==============
 Main:
-    GOTO STATE_SELECT_LOOP
-    goto         Main         ; do this loop forever
+    ; P3 power-on: send greeting via UART, then start in Attack mode (LLI).
+    ;TODO greeting source should be EEPROM (I2C) not flash.
+    CALL    SEND_GREETING_ONLY
+    CALL    SEND_ATTACK_BANNER
+    MOVLW   LLI_state_val
+    MOVWF   must_navigate_to_var, a
+    MOVWF   current_state_var, a
+    GOTO    STATE_NAV
     
     
     
@@ -641,37 +702,42 @@ Main:
 STATE_SELECT_LOOP:
 ;<editor-fold defaultstate="collapsed" desc="SELECT STATE LOOP">
     ;;Interrupts cause change in state inside this loop
-    
+
     ;;This loop sets up display and selection for the state
-    
+
     ;;The first block is storing the selectable state as data
     ;;The second is loading the correct display bits for that state's selection
-    
+
     MOVLW   0x0
     MOVWF   current_state_var,a
     MOVF    current_state_var, W, a
-    
+
+    ; P3: entering main menu — print greeting + full menu over UART.
+    CALL    SEND_GREETING_AND_MENU
+
+    ; P3: main-menu SSD is always "0". The hardware-parallel cycle still
+    ; advances display_select_state_var so RB1 can commit C/R/A.
     MOVLW   calibrating_state_val
     MOVWF   display_select_state_var,a
-    MOVLW   C_SSD
+    MOVLW   DIGIT_0_SSD
     MOVWF   current_state_symbol_var,a
     call    STATE_SELECT_INPUT
-    
+
     MOVLW   feedback_color_state_val
     MOVWF   display_select_state_var,a
-    MOVLW   F_SSD
+    MOVLW   DIGIT_0_SSD
     MOVWF   current_state_symbol_var,a
     call    STATE_SELECT_INPUT
-    
+
     MOVLW   LLI_state_val
     MOVWF   display_select_state_var,a
-    MOVLW   L_SSD
+    MOVLW   DIGIT_0_SSD
     MOVWF   current_state_symbol_var,a
     call    STATE_SELECT_INPUT
-    
+
     MOVLW   osc_delay_state_val
     MOVWF   display_select_state_var,a
-    MOVLW   O_SSD
+    MOVLW   DIGIT_0_SSD
     MOVWF   current_state_symbol_var,a
     call    STATE_SELECT_INPUT
        
@@ -769,6 +835,17 @@ STATE_NAV:
     MOVF    current_state_var,W, a        ; WREG = state
     XORLW    osc_delay_state_val        ; WREG = state ^ lit
     BZ        to_osc_delay
+
+    ;NOT EQUALS CHECK — P3 simulate
+    MOVF    current_state_var,W, a
+    XORLW   simulate_state_val
+    BZ      to_simulate
+
+    ;NOT EQUALS CHECK — P3 hotload
+    MOVF    current_state_var,W, a
+    XORLW   hotload_state_val
+    BZ      to_hotload
+
 ;;If the current set state is not found (eg selecting_state_val = 0x0), go select a valid state
     GOTO    STATE_SELECT_LOOP
 to_cal:
@@ -779,6 +856,10 @@ to_colour_feedback:
     GOTO    FEEDBACK_COLOUR_STATE
 to_osc_delay:
     GOTO    OSC_DELAY_STATE
+to_simulate:
+    GOTO    SIMULATE_STATE
+to_hotload:
+    GOTO    HOTLOAD_STATE
 ;</editor-fold>
 
     
@@ -786,17 +867,21 @@ to_osc_delay:
     
 NAV_STATE_IF_REQUIRED:
 ;<editor-fold defaultstate="collapsed" desc="NAV_STATE_IF_REQUIRED">
+    ; P3: every navigation check also drains the UART for a menu command,
+    ; so any byte that arrives mid-state can redirect the FSM.
+    CALL    POLL_UART_CMD
+
     MOVF    must_navigate_to_var,W,a
     CPFSEQ  current_state_var,a
     BRA        NSIR_CHANGE_REQUIRED
-    
+
     ;;CHANGE NOT REQUIRED
     return
     
     ;;CHANGE REQUIRED|
     NSIR_CHANGE_REQUIRED:
     MOVWF   current_state_var,a
-;    POP        ;;Prevents stack overflow after ~30 change required calls
+    POP                                 ; discard caller's return — STATE_NAV never returns here
     GOTO    STATE_NAV
     
 ;</editor-fold>
@@ -809,8 +894,9 @@ CAL_STATE:
 ;<editor-fold defaultstate="collapsed" desc="CAL SECTION">
 
 ;<editor-fold defaultstate="collapsed" desc="CAL_STATE">
-    
-    MOVLW   C_SSD
+
+    ; P3: SSD shows "2" while in Reference/calibration mode.
+    MOVLW   DIGIT_2_SSD
     MOVWF   current_state_symbol_var,a
     MOVFF   current_state_symbol_var,SSD_OUT_var
     call    SET_SSD
@@ -955,14 +1041,18 @@ STROBE_SAVE_CAL_BLACK_FLOOR:
 FEEDBACK_COLOUR_STATE:
 ;<editor-fold defaultstate="collapsed" desc="FEEDBACK COLOUR SECTION">
 ;<editor-fold defaultstate="collapsed" desc="FEEDBACK COLOUR STATE">
-    MOVLW   F_SSD
+    ; P3: SSD shows "1" while in (C)olour mode.
+    MOVLW   DIGIT_1_SSD
     MOVWF   current_state_symbol_var,a
     MOVFF   current_state_symbol_var,SSD_OUT_var
     call    SET_SSD
-    
+
     call    poll_sensors_for_average_detected_colour
     call    disp_centre_sensor_stored_colour
-    
+
+    ; P3: while in C-mode also accept R/G/B/k via UART to set RACE_COL_var.
+    CALL    POLL_COLOUR_SUBCMD
+
     call    NAV_STATE_IF_REQUIRED
 GOTO    FEEDBACK_COLOUR_STATE
     
@@ -1051,7 +1141,9 @@ GOTO    FEEDBACK_COLOUR_STATE
     
 LLI_STATE:
 ;<editor-fold defaultstate="collapsed" desc="LLI SECTION">
-    MOVLW   L_SSD
+    ; P3: Attack mode. SSD shows "3" until the cap-touch trigger starts a race,
+    ; then SSD shows the race-colour letter (r/G/b/k).
+    MOVLW   DIGIT_3_SSD
     MOVWF   current_state_symbol_var,a
     MOVFF   current_state_symbol_var,SSD_OUT_var
     call    SET_SSD
@@ -1060,35 +1152,37 @@ LLI_STATE:
 
     call    LLI_SELECT_COLOUR
     call    WAIT_FOR_LLI_TOUCH_START
+
+    ; Touch confirmed -> race starting. SSD now shows race-colour letter.
+    CALL    SET_SSD_RACE_COL
     
     
     LLI_NAV_LOOP:
+    call    NAV_STATE_IF_REQUIRED           ; P3: drain UART + redirect FSM every iteration
     call    POLL_SENSORS_FOR_NEWEST_DRIVING_STATE_AND_UPDATE_STATE
-    
+
     MOVF    DRIVING_STATE_var,W,a
     XORLW   LEFT_DRIVING_STATE_val
     BZ	    set_LLI_left
-    
+
     MOVF    DRIVING_STATE_var,W,a
     XORLW    CENTRE_DRIVING_STATE_val
     BZ	    set_LLI_centre
-    
+
     MOVF    DRIVING_STATE_var,W,a
     XORLW   RIGHT_DRIVING_STATE_val
     BZ	    set_LLI_right
-    
+
     MOVF    DRIVING_STATE_var,W,a
     XORLW   LOST_DRIVING_STATE_val
     BZ	    set_LLI_lost
-    
+
     MOVF    DRIVING_STATE_var,W,a
     XORLW   STOP_DRIVING_STATE_val
     BZ	    has_read_all_black;;Needs a configurable amount of repeats to activate
-    
-    call    NAV_STATE_IF_REQUIRED
-    
+
     CLRF    black_confirm_count_var, a
-    
+
     GOTO    LLI_NAV_LOOP
     
     LLI_NAV_STOP:
@@ -1108,9 +1202,7 @@ LLI_STATE:
     set_LLI_left:
     MOVLW   LEFT_DRIVING_STATE_val
     MOVWF   DRIVING_STATE_var,a
-    MOVLW   L_SSD
-    MOVWF   SSD_OUT_var,a
-    call    SET_SSD
+    ; P3: SSD stays on race-colour letter during racing — do not show direction.
     MOVLW   PWM_SPEED_STOP_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
@@ -1122,9 +1214,7 @@ LLI_STATE:
     set_LLI_centre:
     MOVLW   CENTRE_DRIVING_STATE_val
     MOVWF   DRIVING_STATE_var,a
-    MOVLW   C_SSD
-    MOVWF   SSD_OUT_var,a
-    call    SET_SSD
+    ; P3: SSD stays on race-colour letter during racing — do not show direction.
     MOVLW   PWM_SPEED_FULL_LEFT_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
@@ -1136,9 +1226,7 @@ LLI_STATE:
     set_LLI_right:
     MOVLW   RIGHT_DRIVING_STATE_val
     MOVWF   DRIVING_STATE_var,a
-    MOVLW   r_SSD
-    MOVWF   SSD_OUT_var,a
-    call    SET_SSD
+    ; P3: SSD stays on race-colour letter during racing — do not show direction.
     MOVLW   PWM_SPEED_FULL_RIGHT_val
     MOVWF   motor_power_left_var, a
     call    set_motor_left
@@ -1150,9 +1238,7 @@ LLI_STATE:
     set_LLI_lost:
     MOVLW    LOST_DRIVING_STATE_val
     MOVWF    DRIVING_STATE_var,a
-    MOVLW    U_SSD
-    MOVWF    SSD_OUT_var,a
-    call    SET_SSD
+    ; P3: SSD stays on race-colour letter during racing — do not show direction.
     ;Only set the SSD in lost mode. Keep the motor power ratings from the previous activation
 ;    MOVLW   PWM_SPEED_STOP_val
 ;    MOVWF   motor_power_left_var, a
@@ -1278,6 +1364,11 @@ WAIT_FOR_TOUCH:
     CLRF    touch_timer_var, a
 
 WFT_POLL:
+    ; P3: drain UART so a menu byte during touch-wait can navigate us away.
+    CALL    POLL_UART_CMD
+    MOVF    must_navigate_to_var, W, a
+    XORLW   LLI_state_val
+    BNZ     WFT_UART_NAV_OUT
     ; Average 16 samples to reduce noise floor
     CLRF    touch_sample1_var, a    ; accumulator high
     CLRF    touch_sample2_var, a    ; accumulator low
@@ -1355,6 +1446,16 @@ WFT_TIMEOUT_RST:
     CLRF    touch_timer_var, a
     BRA     WFT_POLL
 
+WFT_UART_NAV_OUT:
+    ; P3: navigation requested via UART — restore peripherals and bail.
+    MOVLB   0xF
+    BCF     ANSELB, 2, b
+    MOVLB   0x0
+    CLRF    ADCON1, a
+    MOVLW   00101011B
+    MOVWF   ADCON2, a
+    RETURN
+
 
 ; ============================================================
 ; CAP_TOUCH_ROUTINE: CTMU-based cap touch on RB2/AN8 -> touch_adc_h
@@ -1397,9 +1498,13 @@ CAP_TOUCH_ROUTINE:
 
     ; 6. Trigger ADC ? CTMU keeps charging pad+S/H during acquisition
     BSF     ADCON0, 1, a        ; GO = 1
+    SETF    cap_poll_counter_var, a     ; ~255 poll iters: bound the loop for sim
 CAP_ADC_POLL:
-    BTFSC   ADCON0, 1, a
+    BTFSS   ADCON0, 1, a        ; if GO cleared (ADC done) -> exit
+    BRA     CAP_ADC_DONE
+    DECFSZ  cap_poll_counter_var, f, a
     BRA     CAP_ADC_POLL
+CAP_ADC_DONE:
 
     ; 7. Stop CTMU after sampling
     MOVLB   0xF
@@ -2201,6 +2306,635 @@ display_error:
       
     
 ;</editor-fold>
+
+
+; ============================================================
+; PRAC_3 helpers retained from the old LCD driver:
+;   - PRAC_3_PRINT_HEX prints a byte as 2 ASCII hex chars over UART
+;   - _PRAC_3_DELAY_{50US,2MS,5MS} are generic busy-waits useful for
+;     I2C EEPROM Twc / ack-poll timing.
+; The LCD bit-bang routines were removed (the HD44780 is not wired in P3).
+; ============================================================
+
+; --- PRAC_3_PRINT_HEX ---
+; Print byte in W as two ASCII hex digits (e.g. 0x4F -> "4F").
+; Uses lcd_temp3_var to survive the nested UART_TX calls.
+PRAC_3_PRINT_HEX:
+    MOVWF   lcd_temp3_var, a        ; save full byte
+    SWAPF   lcd_temp3_var, W, a
+    ANDLW   0x0F
+    CALL    _PRAC_3_HEX_DIGIT          ; high nibble
+    MOVF    lcd_temp3_var, W, a
+    ANDLW   0x0F
+    CALL    _PRAC_3_HEX_DIGIT          ; low nibble
+    RETURN
+
+; Convert nibble in W[3:0] to ASCII and send via UART_TX.
+_PRAC_3_HEX_DIGIT:
+    ANDLW   0x0F
+    MOVWF   lcd_temp_var, a         ; save nibble (0-15)
+    MOVLW   0x0A
+    CPFSLT  lcd_temp_var, a         ; skip if nibble < 10
+    BRA     _PRAC_3_HD_LETTER
+    MOVF    lcd_temp_var, W, a
+    ADDLW   0x30                    ; '0'-'9'
+    BRA     _PRAC_3_HD_SEND
+_PRAC_3_HD_LETTER:
+    MOVF    lcd_temp_var, W, a
+    ADDLW   0x37                    ; 'A'-'F'
+_PRAC_3_HD_SEND:
+    CALL    UART_TX
+    RETURN
+
+; --- _PRAC_3_DELAY_50US ---
+; ~50 �s busy-wait (covers 37 �s HD44780 command execution time).
+_PRAC_3_DELAY_50US:
+    MOVLW   0x0D                    ; 13 x 4 cycles = 52 �s
+    MOVWF   lcd_temp_var, a
+_PRAC_3_D50_L:
+    DECFSZ  lcd_temp_var, f, a
+    BRA     _PRAC_3_D50_L
+    RETURN
+
+; --- _PRAC_3_DELAY_2MS ---
+; ~2 ms (Clear Display / Return Home execution time).
+_PRAC_3_DELAY_2MS:
+    MOVLW   0x03                    ; 3 outer x 250 inner x 3 cycles ~ 2.3 ms
+    MOVWF   lcd_temp2_var, a
+_PRAC_3_D2MS_OUT:
+    MOVLW   0xFA
+    MOVWF   lcd_temp_var, a
+_PRAC_3_D2MS_IN:
+    DECFSZ  lcd_temp_var, f, a
+    BRA     _PRAC_3_D2MS_IN
+    DECFSZ  lcd_temp2_var, f, a
+    BRA     _PRAC_3_D2MS_OUT
+    RETURN
+
+; --- _PRAC_3_DELAY_5MS ---
+; ~5 ms (init sequence inter-nibble spacing).
+_PRAC_3_DELAY_5MS:
+    MOVLW   0x08                    ; 8 outer x 250 inner x 3 cycles ~ 6 ms
+    MOVWF   lcd_temp2_var, a
+_PRAC_3_D5MS_OUT:
+    MOVLW   0xFA
+    MOVWF   lcd_temp_var, a
+_PRAC_3_D5MS_IN:
+    DECFSZ  lcd_temp_var, f, a
+    BRA     _PRAC_3_D5MS_IN
+    DECFSZ  lcd_temp2_var, f, a
+    BRA     _PRAC_3_D5MS_OUT
+    RETURN
+
+
+; ============================================================
+; P3 — UART / command-menu support
+; ============================================================
+
+; ---- UART primitives (EUSART1, 9600 8N1, blocking TX) ----
+
+UART_TX:
+    BTFSS   PIR1, 4, a              ; TX1IF = 1 when TXREG1 empty
+    BRA     UART_TX
+    MOVWF   TXREG1, a
+    RETURN
+
+UART_RX_BLOCK:
+    ; SIM HOOK: same as UART_RX_NB — if a byte is queued in sim_rx_pending_var,
+    ; consume that instead of waiting on RCREG1.
+    MOVF    sim_rx_pending_var, W, a
+    BZ      _URBL_HW
+    MOVWF   uart_rx_var, a
+    CLRF    sim_rx_pending_var, a
+    RETURN
+_URBL_HW:
+    BTFSS   PIR1, 5, a              ; RC1IF = 1 when byte received
+    BRA     UART_RX_BLOCK
+    MOVF    RCREG1, W, a
+    MOVWF   uart_rx_var, a
+    RETURN
+
+; Non-blocking RX. Returns W=1 with byte in uart_rx_var if available, W=0 if not.
+; SIM HOOK: if sim_rx_pending_var is nonzero, treat it as a freshly arrived byte.
+; mdb writes to that address to inject a byte without going through the FIFO
+; (the simulator does not populate RCREG1 from external sources reliably).
+UART_RX_NB:
+    MOVF    sim_rx_pending_var, W, a
+    BZ      _URNB_HW
+    MOVWF   uart_rx_var, a
+    CLRF    sim_rx_pending_var, a
+    MOVLW   0x01
+    RETURN
+_URNB_HW:
+    BTFSS   PIR1, 5, a
+    BRA     _URNB_NONE
+    MOVF    RCREG1, W, a
+    MOVWF   uart_rx_var, a
+    MOVLW   0x01
+    RETURN
+_URNB_NONE:
+    MOVLW   0x00
+    RETURN
+
+UART_TX_CRLF:
+    MOVLW   0x0D
+    CALL    UART_TX
+    MOVLW   0x0A
+    CALL    UART_TX
+    RETURN
+
+; UART_TX_ROM_STR: print null-terminated string from TBLPTR. Caller sets TBLPTR
+; via LOAD_TBLPTR before calling.
+UART_TX_ROM_STR:
+    TBLRD*+
+    MOVF    TABLAT, W, a
+    BZ      _UTRS_DONE
+    CALL    UART_TX
+    BRA     UART_TX_ROM_STR
+_UTRS_DONE:
+    RETURN
+
+; ---- UART -> race colour helpers ----
+
+; Map RACE_COL_var enum to ASCII letter, send via UART.
+UART_TX_RACE_COL_LETTER:
+    MOVF    RACE_COL_var, W, a
+    XORLW   RED_COLOUR_STATE_val
+    BZ      _UTRC_R
+    MOVF    RACE_COL_var, W, a
+    XORLW   GREEN_COLOUR_STATE_val
+    BZ      _UTRC_G
+    MOVF    RACE_COL_var, W, a
+    XORLW   BLUE_COLOUR_STATE_val
+    BZ      _UTRC_B
+    MOVF    RACE_COL_var, W, a
+    XORLW   BLACK_COLOUR_STATE_val
+    BZ      _UTRC_K
+    MOVLW   '?'
+    BRA     _UTRC_SEND
+_UTRC_R:
+    MOVLW   'R'
+    BRA     _UTRC_SEND
+_UTRC_G:
+    MOVLW   'G'
+    BRA     _UTRC_SEND
+_UTRC_B:
+    MOVLW   'B'
+    BRA     _UTRC_SEND
+_UTRC_K:
+    MOVLW   'k'
+_UTRC_SEND:
+    CALL    UART_TX
+    RETURN
+
+; Print W (a colour enum) as a single letter (R/G/B/k/W/?).
+UART_TX_COL_ENUM_LETTER:
+    MOVWF   uart_scratch_var, a
+    MOVF    uart_scratch_var, W, a
+    XORLW   RED_COLOUR_STATE_val
+    BZ      _UTCEL_R
+    MOVF    uart_scratch_var, W, a
+    XORLW   GREEN_COLOUR_STATE_val
+    BZ      _UTCEL_G
+    MOVF    uart_scratch_var, W, a
+    XORLW   BLUE_COLOUR_STATE_val
+    BZ      _UTCEL_B
+    MOVF    uart_scratch_var, W, a
+    XORLW   BLACK_COLOUR_STATE_val
+    BZ      _UTCEL_K
+    MOVF    uart_scratch_var, W, a
+    XORLW   WHITE_COLOUR_STATE_val
+    BZ      _UTCEL_W
+    MOVLW   '?'
+    BRA     _UTCEL_SEND
+_UTCEL_R:
+    MOVLW   'R'
+    BRA     _UTCEL_SEND
+_UTCEL_G:
+    MOVLW   'G'
+    BRA     _UTCEL_SEND
+_UTCEL_B:
+    MOVLW   'B'
+    BRA     _UTCEL_SEND
+_UTCEL_K:
+    MOVLW   'k'
+    BRA     _UTCEL_SEND
+_UTCEL_W:
+    MOVLW   'W'
+_UTCEL_SEND:
+    CALL    UART_TX
+    RETURN
+
+; Set SSD to race colour pattern based on RACE_COL_var enum.
+SET_SSD_RACE_COL:
+    MOVF    RACE_COL_var, W, a
+    XORLW   RED_COLOUR_STATE_val
+    BZ      _SSRC_R
+    MOVF    RACE_COL_var, W, a
+    XORLW   GREEN_COLOUR_STATE_val
+    BZ      _SSRC_G
+    MOVF    RACE_COL_var, W, a
+    XORLW   BLUE_COLOUR_STATE_val
+    BZ      _SSRC_B
+    MOVF    RACE_COL_var, W, a
+    XORLW   BLACK_COLOUR_STATE_val
+    BZ      _SSRC_K
+    MOVLW   r_SSD
+    BRA     _SSRC_OUT
+_SSRC_R:
+    MOVLW   r_SSD
+    BRA     _SSRC_OUT
+_SSRC_G:
+    MOVLW   G_SSD
+    BRA     _SSRC_OUT
+_SSRC_B:
+    MOVLW   b_SSD
+    BRA     _SSRC_OUT
+_SSRC_K:
+    MOVLW   k_SSD
+_SSRC_OUT:
+    MOVWF   SSD_OUT_var, a
+    CALL    SET_SSD
+    RETURN
+
+; ---- UART command dispatch ----
+
+; DISPATCH_UART_BYTE: dispatches the byte already in uart_rx_var to a top-level
+; menu command. Bytes that do not match are silently ignored.
+DISPATCH_UART_BYTE:
+    MOVF    uart_rx_var, W, a
+    XORLW   'M'
+    BZ      _PUC_MAIN
+    MOVF    uart_rx_var, W, a
+    XORLW   'A'
+    BZ      _PUC_ATK
+    MOVF    uart_rx_var, W, a
+    XORLW   'R'
+    BZ      _PUC_REF
+    MOVF    uart_rx_var, W, a
+    XORLW   'C'
+    BZ      _PUC_COL
+    MOVF    uart_rx_var, W, a
+    XORLW   'S'
+    BZ      _PUC_SIM
+    MOVF    uart_rx_var, W, a
+    XORLW   'H'
+    BZ      _PUC_HOT
+    RETURN
+
+_PUC_MAIN:
+    MOVLW   selecting_state_val
+    MOVWF   must_navigate_to_var, a
+    RETURN
+_PUC_ATK:
+    MOVLW   LLI_state_val
+    MOVWF   must_navigate_to_var, a
+    RETURN
+_PUC_REF:
+    MOVLW   calibrating_state_val
+    MOVWF   must_navigate_to_var, a
+    RETURN
+_PUC_COL:
+    MOVLW   feedback_color_state_val
+    MOVWF   must_navigate_to_var, a
+    RETURN
+_PUC_SIM:
+    MOVLW   simulate_state_val
+    MOVWF   must_navigate_to_var, a
+    RETURN
+_PUC_HOT:
+    MOVLW   hotload_state_val
+    MOVWF   must_navigate_to_var, a
+    RETURN
+
+; POLL_UART_CMD: non-blocking read + top-level dispatch.
+POLL_UART_CMD:
+    CALL    UART_RX_NB
+    IORLW   0x00                    ; refresh Z from W (MOVLW doesn't touch Z)
+    BZ      _PUCMD_NONE
+    CALL    DISPATCH_UART_BYTE
+_PUCMD_NONE:
+    RETURN
+
+; POLL_COLOUR_SUBCMD: non-blocking read. If the byte is R/G/B/k, set
+; RACE_COL_var and ack. Otherwise, fall through to top-level dispatch
+; (so 'M', 'A', etc. still work from inside C-mode).
+POLL_COLOUR_SUBCMD:
+    CALL    UART_RX_NB
+    IORLW   0x00                    ; refresh Z from W (MOVLW doesn't touch Z)
+    BZ      _PCSC_NONE
+
+    MOVF    uart_rx_var, W, a
+    XORLW   'R'
+    BZ      _PCSC_RED
+    MOVF    uart_rx_var, W, a
+    XORLW   'G'
+    BZ      _PCSC_GRN
+    MOVF    uart_rx_var, W, a
+    XORLW   'B'
+    BZ      _PCSC_BLU
+    MOVF    uart_rx_var, W, a
+    XORLW   'k'
+    BZ      _PCSC_BLK
+
+    ; Not a colour letter — let the top-level dispatcher try.
+    CALL    DISPATCH_UART_BYTE
+_PCSC_NONE:
+    RETURN
+
+_PCSC_RED:
+    MOVLW   RED_COLOUR_STATE_val
+    MOVWF   RACE_COL_var, a
+    BRA     _PCSC_ACK
+_PCSC_GRN:
+    MOVLW   GREEN_COLOUR_STATE_val
+    MOVWF   RACE_COL_var, a
+    BRA     _PCSC_ACK
+_PCSC_BLU:
+    MOVLW   BLUE_COLOUR_STATE_val
+    MOVWF   RACE_COL_var, a
+    BRA     _PCSC_ACK
+_PCSC_BLK:
+    MOVLW   BLACK_COLOUR_STATE_val
+    MOVWF   RACE_COL_var, a
+_PCSC_ACK:
+    LOAD_TBLPTR P3_STR_COL_ACK
+    CALL    UART_TX_ROM_STR
+    CALL    UART_TX_RACE_COL_LETTER
+    CALL    UART_TX_CRLF
+    RETURN
+
+; ---- Power-on greeting + main-menu print ----
+
+; Print greeting + full menu. Currently sourced from program flash.
+;TODO Replace with EEPROM reads (greeting at 0x01, menu at 0x29) via I2C MSSP.
+SEND_GREETING_AND_MENU:
+    CALL    UART_TX_CRLF
+    LOAD_TBLPTR P3_STR_GREETING
+    CALL    UART_TX_ROM_STR
+    CALL    UART_TX_CRLF
+    LOAD_TBLPTR P3_STR_MENU
+    CALL    UART_TX_ROM_STR
+    RETURN
+
+; Print just the greeting (used on power-on).
+SEND_GREETING_ONLY:
+    CALL    UART_TX_CRLF
+    LOAD_TBLPTR P3_STR_GREETING
+    CALL    UART_TX_ROM_STR
+    CALL    UART_TX_CRLF
+    RETURN
+
+; Print "Attack X" + CRLF where X is the race colour letter.
+SEND_ATTACK_BANNER:
+    LOAD_TBLPTR P3_STR_ATTACK
+    CALL    UART_TX_ROM_STR
+    CALL    UART_TX_RACE_COL_LETTER
+    CALL    UART_TX_CRLF
+    RETURN
+
+; ============================================================
+; P3 — Simulate state
+; ============================================================
+SIMULATE_STATE:
+;<editor-fold defaultstate="collapsed" desc="SIMULATE_STATE">
+    MOVLW   simulate_state_val
+    MOVWF   current_state_var, a
+    MOVFF   current_state_var, must_navigate_to_var
+    MOVLW   DIGIT_4_SSD
+    MOVWF   SSD_OUT_var, a
+    CALL    SET_SSD
+
+    CLRF    sim_drive_var, a
+    LOAD_TBLPTR P3_STR_SIM_PROMPT
+    CALL    UART_TX_ROM_STR
+
+SIM_LOOP:
+    CALL    UART_RX_BLOCK           ; wait for next sub-command
+
+    ; 'M' -> back to main menu
+    MOVF    uart_rx_var, W, a
+    XORLW   'M'
+    BZ      _SIM_TO_MAIN
+
+    ; 'S' -> sensor snapshot
+    MOVF    uart_rx_var, W, a
+    XORLW   'S'
+    BZ      _SIM_SENSORS
+
+    ; 'F' -> toggle forward
+    MOVF    uart_rx_var, W, a
+    XORLW   'F'
+    BZ      _SIM_FWD
+
+    ; 'L' -> toggle left
+    MOVF    uart_rx_var, W, a
+    XORLW   'L'
+    BZ      _SIM_LEFT
+
+    ; 'R' -> toggle right
+    MOVF    uart_rx_var, W, a
+    XORLW   'R'
+    BZ      _SIM_RIGHT
+
+    ; ignore unknown chars
+    BRA     SIM_LOOP
+
+_SIM_TO_MAIN:
+    CALL    SIM_STOP_MOTORS
+    MOVLW   selecting_state_val
+    MOVWF   must_navigate_to_var, a
+    GOTO    STATE_NAV
+
+_SIM_SENSORS:
+    CALL    POLL_SENSORS_FOR_NEWEST_DRIVING_STATE_AND_UPDATE_STATE
+    LOAD_TBLPTR P3_STR_SIM_SENSE
+    CALL    UART_TX_ROM_STR
+    MOVF    sensor_L_read_colour_enum_var, W, a
+    CALL    UART_TX_COL_ENUM_LETTER
+    MOVF    sensor_C_read_colour_enum_var, W, a
+    CALL    UART_TX_COL_ENUM_LETTER
+    MOVF    sensor_R_read_colour_enum_var, W, a
+    CALL    UART_TX_COL_ENUM_LETTER
+    CALL    UART_TX_CRLF
+    BRA     SIM_LOOP
+
+_SIM_FWD:
+    ; If already driving forward, stop; else drive forward.
+    MOVLW   0x01
+    XORWF   sim_drive_var, W, a
+    BZ      _SIM_STOP_FROM_FWD
+    MOVLW   0x01
+    MOVWF   sim_drive_var, a
+    CALL    SIM_DRIVE_FORWARD
+    BRA     SIM_LOOP
+_SIM_STOP_FROM_FWD:
+    CALL    SIM_STOP_MOTORS
+    BRA     SIM_LOOP
+
+_SIM_LEFT:
+    MOVLW   0x02
+    XORWF   sim_drive_var, W, a
+    BZ      _SIM_STOP_FROM_LEFT
+    MOVLW   0x02
+    MOVWF   sim_drive_var, a
+    CALL    SIM_DRIVE_LEFT
+    BRA     SIM_LOOP
+_SIM_STOP_FROM_LEFT:
+    CALL    SIM_STOP_MOTORS
+    BRA     SIM_LOOP
+
+_SIM_RIGHT:
+    MOVLW   0x03
+    XORWF   sim_drive_var, W, a
+    BZ      _SIM_STOP_FROM_RIGHT
+    MOVLW   0x03
+    MOVWF   sim_drive_var, a
+    CALL    SIM_DRIVE_RIGHT
+    BRA     SIM_LOOP
+_SIM_STOP_FROM_RIGHT:
+    CALL    SIM_STOP_MOTORS
+    BRA     SIM_LOOP
+;</editor-fold>
+
+; ---- Simulate-mode motor primitives ----
+SIM_STOP_MOTORS:
+    CLRF    sim_drive_var, a
+    CLRF    motor_dir_left_var, a
+    CLRF    motor_dir_right_var, a
+    MOVLW   PWM_SPEED_STOP_val
+    MOVWF   motor_power_left_var, a
+    MOVWF   motor_power_right_var, a
+    CALL    set_motor_left
+    CALL    set_motor_right
+    LOAD_TBLPTR P3_STR_SIM_STOP
+    CALL    UART_TX_ROM_STR
+    RETURN
+
+SIM_DRIVE_FORWARD:
+    CLRF    motor_dir_left_var, a
+    CLRF    motor_dir_right_var, a
+    MOVLW   PWM_SPEED_FULL_LEFT_val
+    MOVWF   motor_power_left_var, a
+    MOVLW   PWM_SPEED_FULL_RIGHT_val
+    MOVWF   motor_power_right_var, a
+    CALL    set_motor_left
+    CALL    set_motor_right
+    LOAD_TBLPTR P3_STR_SIM_FWD
+    CALL    UART_TX_ROM_STR
+    RETURN
+
+SIM_DRIVE_LEFT:
+    CLRF    motor_dir_left_var, a
+    CLRF    motor_dir_right_var, a
+    MOVLW   PWM_SPEED_STOP_val
+    MOVWF   motor_power_left_var, a
+    MOVLW   PWM_SPEED_FULL_RIGHT_val
+    MOVWF   motor_power_right_var, a
+    CALL    set_motor_left
+    CALL    set_motor_right
+    LOAD_TBLPTR P3_STR_SIM_LEFT
+    CALL    UART_TX_ROM_STR
+    RETURN
+
+SIM_DRIVE_RIGHT:
+    CLRF    motor_dir_left_var, a
+    CLRF    motor_dir_right_var, a
+    MOVLW   PWM_SPEED_FULL_LEFT_val
+    MOVWF   motor_power_left_var, a
+    MOVLW   PWM_SPEED_STOP_val
+    MOVWF   motor_power_right_var, a
+    CALL    set_motor_left
+    CALL    set_motor_right
+    LOAD_TBLPTR P3_STR_SIM_RIGHT
+    CALL    UART_TX_ROM_STR
+    RETURN
+
+; ============================================================
+; P3 — Hotload state
+; ============================================================
+HOTLOAD_STATE:
+;<editor-fold defaultstate="collapsed" desc="HOTLOAD_STATE">
+    MOVLW   hotload_state_val
+    MOVWF   current_state_var, a
+    MOVFF   current_state_var, must_navigate_to_var
+    MOVLW   DIGIT_5_SSD
+    MOVWF   SSD_OUT_var, a
+    CALL    SET_SSD
+
+    LOAD_TBLPTR P3_STR_HOT_PROMPT
+    CALL    UART_TX_ROM_STR
+
+HOT_READ_LOOP:
+    CALL    UART_RX_BLOCK
+    MOVF    uart_rx_var, W, a
+    XORLW   0x0D                    ; CR ends the slogan
+    BZ      _HOT_DONE
+    MOVF    uart_rx_var, W, a       ; echo char so the user can see typing
+    CALL    UART_TX
+    ;TODO write uart_rx_var to EEPROM at the next slogan address via I2C
+    BRA     HOT_READ_LOOP
+
+_HOT_DONE:
+    ;TODO write a null terminator to EEPROM via I2C
+    CALL    UART_TX_CRLF
+    LOAD_TBLPTR P3_STR_HOT_DONE
+    CALL    UART_TX_ROM_STR
+
+    ; Hotload finished -> return to main menu
+    MOVLW   selecting_state_val
+    MOVWF   must_navigate_to_var, a
+    GOTO    STATE_NAV
+;</editor-fold>
+
+; ============================================================
+; P3 — Flash strings (placeholder until EEPROM is wired)
+; ============================================================
+;TODO All of these strings should ultimately live in the external I2C EEPROM
+;     so the H-mode hotload can rewrite them at runtime. Flash storage here
+;     is a stand-in so the menu prints something during development.
+    org 0x4000
+
+P3_STR_GREETING:
+    db  "Will I dream of electric sheep?", 0
+
+P3_STR_MENU:
+    db  "Choose your MARV mode...", 0x0D, 0x0A
+    db  "(C)olour", 0x0D, 0x0A
+    db  "(R)eference", 0x0D, 0x0A
+    db  "(A)ttack", 0x0D, 0x0A
+    db  "(S)imulate race", 0x0D, 0x0A
+    db  "(H)otload EEPROM", 0x0D, 0x0A, 0
+
+P3_STR_ATTACK:
+    db  "Attack ", 0                ; caller appends race colour + CRLF
+
+P3_STR_COL_ACK:
+    db  "Race colour set to: ", 0   ; caller appends race colour + CRLF
+
+P3_STR_SIM_PROMPT:
+    db  "Simulate mode. S=sensors F=fwd L=left R=right M=menu", 0x0D, 0x0A, 0
+
+P3_STR_SIM_SENSE:
+    db  "Sensors L C R: ", 0
+
+P3_STR_SIM_FWD:
+    db  "Forward", 0x0D, 0x0A, 0
+
+P3_STR_SIM_LEFT:
+    db  "Left", 0x0D, 0x0A, 0
+
+P3_STR_SIM_RIGHT:
+    db  "Right", 0x0D, 0x0A, 0
+
+P3_STR_SIM_STOP:
+    db  "Stop", 0x0D, 0x0A, 0
+
+P3_STR_HOT_PROMPT:
+    db  "Hotload: type new slogan then press Enter:", 0x0D, 0x0A, 0
+
+P3_STR_HOT_DONE:
+    db  "Slogan stored. (TODO: persist via I2C EEPROM)", 0x0D, 0x0A, 0
 
 
 end
