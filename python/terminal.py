@@ -64,7 +64,7 @@ term_frame.pack(fill='both', expand=True, padx=8, pady=(8, 4))
 
 terminal = scrolledtext.ScrolledText(
     term_frame, bg='#1e1e1e', fg='#dddddd', insertbackground='#dddddd',
-    font=('Menlo', 11), wrap='word', height=22, relief='flat',
+    font=('Menlo', 11), wrap='none', height=22, relief='flat',
 )
 terminal.pack(fill='both', expand=True)
 terminal.tag_config('local', foreground='#66ccff')

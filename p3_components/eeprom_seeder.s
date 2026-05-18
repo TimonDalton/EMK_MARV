@@ -1,11 +1,10 @@
-; eeprom_seeder.s — multi-line EEPROM seeder for the 24LC16B.
+; eeprom_seeder.s — single-line slogan seeder for the 24LC16B.
 ;
 ; Loop:
 ;   1. Read EEPROM[0..] sequentially until backtick (0x60) or 0xFF, echo to UART
-;   2. Print "Enter String (end with `):\r\n"
-;   3. Read UART input until backtick:
-;        - each typed CR (0x0D) is stored as CRLF (0x0D 0x0A) in the buffer
-;        - backtick is stored as the terminator and ends input
+;   2. Print "Enter Slogan:\r\n"
+;   3. Read UART input until Enter (CR, 0x0D); CR is not stored.
+;      A backtick (0x60) is auto-appended to mark end-of-data.
 ;   4. Byte-by-byte write of the buffered content to EEPROM[0..]
 ;
 ; Pin assignments:
@@ -33,7 +32,8 @@ CUR_ADDR    EQU 0x06
 
 WRITE_CTRL  EQU 10100000B
 READ_CTRL   EQU 10100001B
-TERMINATOR  EQU 0x60            ; backtick — end-of-data marker
+TERMINATOR  EQU 0x60            ; backtick — end-of-data marker stored in EEPROM
+COMMIT_KEY  EQU 0x0D            ; Enter (CR) ends UART input
 
 PSECT code,abs
     org 00h
@@ -148,36 +148,31 @@ ERO_NACK:
 ERO_DONE:
     RETURN
 
-; ---- Read UART into buffer until backtick, then byte-by-byte write to EEPROM ----
+; ---- Read UART into buffer until Enter, append backtick, byte-by-byte write ----
 
 UART_READ_WRITE:
+    ; Drain any pending RX byte (e.g. LF left over from a previous CR+LF Enter)
+    CALL    UART_RX_DRAIN
     LFSR    0, 0x100            ; buffer base
     CLRF    ADDR, a             ; count of bytes received
 URW_READ:
     CALL    UART_RX
     MOVWF   RX_BYTE, a
-    ; CR (0x0D) -> store CRLF; backtick (0x60) -> store and commit; else -> store
     MOVF    RX_BYTE, W, a
-    XORLW   0x0D
-    BZ      URW_STORE_CRLF
+    XORLW   COMMIT_KEY          ; Enter ends input (not stored)
+    BZ      URW_APPEND_TERM
+    MOVF    RX_BYTE, W, a
+    XORLW   0x0A                ; ignore LF (handles CR+LF terminals)
+    BZ      URW_READ
     MOVF    RX_BYTE, W, a
     MOVWF   POSTINC0, a
     INCF    ADDR, F, a
     BZ      URW_DONE_READING    ; 256-byte wrap forces commit
-    MOVF    RX_BYTE, W, a
-    XORLW   TERMINATOR
-    BZ      URW_DONE_READING
     BRA     URW_READ
-URW_STORE_CRLF:
-    MOVLW   0x0D
+URW_APPEND_TERM:
+    MOVLW   TERMINATOR          ; append backtick at end of slogan
     MOVWF   POSTINC0, a
     INCF    ADDR, F, a
-    BZ      URW_DONE_READING
-    MOVLW   0x0A
-    MOVWF   POSTINC0, a
-    INCF    ADDR, F, a
-    BZ      URW_DONE_READING
-    BRA     URW_READ
 URW_DONE_READING:
 
     ; Byte-by-byte write of ADDR bytes from buffer 0x100 to EEPROM[0..]
@@ -202,7 +197,7 @@ URW_BYTE_LOOP:
     BRA     URW_BYTE_LOOP
     RETURN
 
-; ---- "Enter String (end with `):\r\n" ----
+; ---- "Enter Slogan:\r\n" ----
 
 PRINT_PROMPT:
     MOVLW   'E'
@@ -219,41 +214,15 @@ PRINT_PROMPT:
     CALL    UART_TX
     MOVLW   'S'
     CALL    UART_TX
-    MOVLW   't'
+    MOVLW   'l'
     CALL    UART_TX
-    MOVLW   'r'
-    CALL    UART_TX
-    MOVLW   'i'
-    CALL    UART_TX
-    MOVLW   'n'
+    MOVLW   'o'
     CALL    UART_TX
     MOVLW   'g'
     CALL    UART_TX
-    MOVLW   ' '
-    CALL    UART_TX
-    MOVLW   '('
-    CALL    UART_TX
-    MOVLW   'e'
+    MOVLW   'a'
     CALL    UART_TX
     MOVLW   'n'
-    CALL    UART_TX
-    MOVLW   'd'
-    CALL    UART_TX
-    MOVLW   ' '
-    CALL    UART_TX
-    MOVLW   'w'
-    CALL    UART_TX
-    MOVLW   'i'
-    CALL    UART_TX
-    MOVLW   't'
-    CALL    UART_TX
-    MOVLW   'h'
-    CALL    UART_TX
-    MOVLW   ' '
-    CALL    UART_TX
-    MOVLW   0x60                ; backtick
-    CALL    UART_TX
-    MOVLW   ')'
     CALL    UART_TX
     MOVLW   ':'
     CALL    UART_TX
@@ -278,6 +247,19 @@ URX_OERR:
     BCF     RCSTA1, 4, a
     BSF     RCSTA1, 4, a
     BRA     UART_RX
+
+; Discard any byte sitting in RCREG1, and clear OERR if set. Non-blocking.
+UART_RX_DRAIN:
+    BTFSC   RCSTA1, 1, a        ; OERR set?
+    BRA     URXD_CLR_OERR
+    BTFSS   PIR1, 5, a          ; RCIF?
+    RETURN
+    MOVF    RCREG1, W, a        ; read+discard
+    BRA     UART_RX_DRAIN
+URXD_CLR_OERR:
+    BCF     RCSTA1, 4, a
+    BSF     RCSTA1, 4, a
+    RETURN
 
 UART_CRLF:
     MOVLW   0x0D
