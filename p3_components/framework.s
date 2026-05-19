@@ -1,11 +1,19 @@
 ; Prac 3 firmware. CYOC menu cycles C/R/A/S/H candidates; UART chars nav direct.
-;
-; Pins:
-;   PORTA<6:0> SSD, bit 7 DP        PORTB<5:7> RGB display LED
-;   RB0 yellow, RB1 red (INT0/1)    RB2 cap-touch (AN8)
-;   PORTD<0:2> strobe LEDs          PORTE<0:2> sensors (AN5/6/7)
-;   RC1/RC2 motor PWM (CCP2/CCP1)   RC0 IN2, RD3 IN4 (reverse, held low)
-;   RC3 SCL, RC4 SDA                RC6 TX, RC7 RX (9600)
+
+;PORT MAPPING
+
+;SSD            PORTA; <0:6> a-g, <7> DP
+;DISP LED       PORTB; <5:7> R,G,B
+;Buttons        PORTB; <0:1> yellow,red (INT0/INT1)
+;Cap touch      PORTB; <2> RB2/AN8
+;Motors         PORTC; <1> IN1 left fwd (CCP2 PWM)
+;               PORTC; <2> IN3 right fwd (CCP1 PWM)
+;               PORTC; <0> IN2 left reverse
+;               PORTD; <3> IN4 right reverse — moved off RC3 because RC3 is SCL
+;I2C            PORTC; <3> SCL, <4> SDA (EEPROM, took RC3 from IN4)
+;UART           PORTC; <6> TX, <7> RX @ 9600 8N1
+;Strobe LED     PORTD; <0:2> R,G,B
+;Sensors        PORTE; <0:2> L,C,R (AN5/AN6/AN7 analog)
 
     PROCESSOR 18F45K22
 
@@ -229,7 +237,7 @@ ISR:
 
 UART_RX_HANDLER:
     BTFSC   RCSTA1, 1, a
-    BRA     URX_OERR
+    BRA     URX_OERR_RETFIE
     MOVF    RCREG1, W, a
     MOVWF   uart_rx_char_var, a
 
@@ -291,6 +299,12 @@ URX_OERR:
     BCF     RCSTA1, 4, a
     BSF     RCSTA1, 4, a
     RETURN
+    
+    
+URX_OERR_RETFIE:
+    BCF     RCSTA1, 4, a
+    BSF     RCSTA1, 4, a
+    RETFIE
 
 URX_TOGGLE_FWD:
     MOVF    motor_mode_var, W, a
@@ -567,6 +581,7 @@ NSIR_DISPATCH:
     MOVWF   CCPR1L, a
     MOVWF   CCPR2L, a
     CLRF    motor_mode_var, a
+    BSF     PIE1, 5, a
     POP
     GOTO    STATE_NAV
 
@@ -711,7 +726,7 @@ REFERENCE_STATE:
     CALL    STROBE_SAVE_CAL_BLACK_FLOOR
     BCF     SSD_OUT_var, 7, a
     CALL    SET_SSD
-    CALL    PRINT_CAL_READINGS
+;    CALL    PRINT_CAL_READINGS
     CALL    PRINT_CAL_DONE
 
     CALL    set_disp_rgb_black
@@ -724,6 +739,8 @@ REF_LOOP:
 ATTACK_STATE:
     MOVLW   attack_state_val
     MOVWF   current_state_var, a
+    BCF     PIE1, 5, a
+    CALL    UART_RX_DRAIN
     MOVLW   digit_3_SSD
     MOVWF   SSD_OUT_var, a
     CALL    SET_SSD
@@ -2617,9 +2634,6 @@ PRINT_CAL_DONE:
     CALL    UART_TX
     GOTO    UART_CRLF
 
-; "L:HH,HH,HH C:HH,HH,HH R:HH,HH,HH\r\n"
-; Prints the 9 readings just captured into sensor_*_strobe_*_reading_var
-; (also copied into CAL_*_var by STROBE_SAVE_CAL_*_FLOOR).
 PRINT_CAL_READINGS:
     MOVLW   'L'
     CALL    UART_TX
@@ -2669,7 +2683,6 @@ PRINT_CAL_READINGS:
     CALL    PRINT_HEX_BYTE
     GOTO    UART_CRLF
 
-; W = byte → prints two ASCII hex digits (e.g. 0x2F → "2F")
 PRINT_HEX_BYTE:
     MOVWF   temp_var, a
     SWAPF   temp_var, W, a
@@ -2679,7 +2692,6 @@ PRINT_HEX_BYTE:
     CALL    HEX_NIBBLE_TO_ASCII
     GOTO    UART_TX
 
-; W = nibble (low 4 bits) → W = ASCII '0'-'9' or 'A'-'F'
 HEX_NIBBLE_TO_ASCII:
     ANDLW   0x0F
     MOVWF   temp_var2, a

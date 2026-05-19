@@ -74,7 +74,7 @@ main:
 
 ; ============================================================
 motor_loop:
-    BTFSC   PORTB, 0, a         ; skip if RB0 low (not pressed)
+;    BTFSC   PORTB, 0, a         ; skip if RB0 low (not pressed)
     BRA     drive_forward
 
     ; RB0 not pressed — stop
